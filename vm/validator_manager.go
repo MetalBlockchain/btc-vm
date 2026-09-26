@@ -20,13 +20,16 @@ import (
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/network/p2p"
 	"github.com/MetalBlockchain/metalgo/network/p2p/acp118"
+	"github.com/MetalBlockchain/metalgo/proto/pb/sdk"
 	"github.com/MetalBlockchain/metalgo/snow/engine/common"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/formatting/address"
 	"github.com/MetalBlockchain/metalgo/utils/set"
 	"github.com/MetalBlockchain/metalgo/vms/platformvm/warp"
 	"github.com/MetalBlockchain/metalgo/vms/platformvm/warp/message"
 	"github.com/MetalBlockchain/metalgo/vms/platformvm/warp/payload"
+	"google.golang.org/protobuf/proto"
 )
 
 // The L1's validator manager.
@@ -86,9 +89,9 @@ func parseValidatorAdmins(configBytes []byte) (set.Set[ids.ShortID], error) {
 }
 
 type validatorManager struct {
-	vm         *VM
-	admins     set.Set[ids.ShortID]
-	aggregator *acp118.SignatureAggregator
+	vm     *VM
+	admins set.Set[ids.ShortID]
+	client *p2p.Client
 }
 
 var _ acp118.Verifier = (*validatorManager)(nil)
@@ -196,44 +199,127 @@ func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, just
 		}
 	}
 
-	// This node's own signature first; the aggregator asks only the others.
-	sig := &warp.BitSetSignature{}
-	for i, v := range vdrs.Validators {
-		if !containsNode(v.NodeIDs, snowCtx.NodeID) {
-			continue
-		}
-		own, err := snowCtx.WarpSigner.Sign(unsigned)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("signing: %w", err)
-		}
-		bits := set.NewBits(i)
-		sig.Signers = bits.Bytes()
-		copy(sig.Signature[:], own)
-		break
-	}
-	msg, err := warp.NewMessage(unsigned, sig)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// The P-Chain accepts signed*100 >= total*67 over the whole set's weight.
-	// The aggregator floors total*num/den and returns what it has on a
-	// timeout, so ask it for exactly the weight needed and check the result.
 	need := requiredWeight(vdrs.TotalWeight)
-	var listed uint64
-	for _, v := range vdrs.Validators {
-		listed += v.Weight
-	}
-	if listed < need {
-		return nil, nil, nil, fmt.Errorf("the L1's validators with BLS keys hold weight %d; %d must sign", listed, need)
-	}
-	signed, signedWeight, total, err := m.aggregator.AggregateSignatures(ctx, msg, justification, vdrs.Validators, need, listed)
+	signed, weight, err := m.collect(ctx, unsigned, justification, vdrs, need)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if !quorum(signedWeight, vdrs.TotalWeight) {
-		return nil, nil, nil, fmt.Errorf("only weight %s of %d signed; the P-Chain needs %d (are enough validators online?)", signedWeight, vdrs.TotalWeight, need)
+	total := new(big.Int).SetUint64(vdrs.TotalWeight)
+	// The P-Chain's own check, at the same quorum, before anyone gets it: a
+	// message it would reject (too little weight, a bad signature) never
+	// leaves this node.
+	if err := signed.Signature.Verify(unsigned, snowCtx.NetworkID, vdrs, 67, 100); err != nil {
+		return nil, nil, nil, fmt.Errorf("only weight %s of %d signed (the P-Chain needs %d): %w", weight, vdrs.TotalWeight, need, err)
 	}
-	return signed, signedWeight, total, nil
+	return signed, weight, total, nil
+}
+
+type signatureReply struct {
+	index int
+	sig   *bls.Signature
+}
+
+// collect gathers the L1 validators' signatures on an approved message until
+// they reach need, every validator has answered, or ctx ends. (metalgo's
+// acp118.SignatureAggregator sends replies on an unbuffered channel it
+// stops reading once it has enough, so each late reply blocks one of the
+// chain's app-message workers for good. Here late replies are dropped.)
+func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedMessage, justification []byte, vdrs warp.CanonicalValidatorSet, need uint64) (*warp.Message, *big.Int, error) {
+	snowCtx := m.vm.ctx
+	bits := set.NewBits()
+	var sigs []*bls.Signature
+	weight := new(big.Int)
+	add := func(i int, sig *bls.Signature) {
+		if bits.Contains(i) {
+			return // validators can share a key: count it once
+		}
+		bits.Add(i)
+		sigs = append(sigs, sig)
+		weight.Add(weight, new(big.Int).SetUint64(vdrs.Validators[i].Weight))
+	}
+
+	// This node's own signature, if it is a validator and its key is the one
+	// the P-Chain has for it (a rotated staking key would not be).
+	nodeIndex := map[ids.NodeID]int{}
+	for i, v := range vdrs.Validators {
+		for _, n := range v.NodeIDs {
+			nodeIndex[n] = i
+		}
+	}
+	if i, ok := nodeIndex[snowCtx.NodeID]; ok {
+		raw, err := snowCtx.WarpSigner.Sign(unsigned)
+		if err != nil {
+			return nil, nil, fmt.Errorf("signing: %w", err)
+		}
+		if sig, err := bls.SignatureFromBytes(raw); err == nil && bls.Verify(vdrs.Validators[i].PublicKey, sig, unsigned.Bytes()) {
+			add(i, sig)
+		} else {
+			snowCtx.Log.Warn("this node's signature doesn't match its registered BLS key; not counting it")
+		}
+	}
+
+	others := set.Set[ids.NodeID]{}
+	for n := range nodeIndex {
+		if n != snowCtx.NodeID {
+			others.Add(n)
+		}
+	}
+	replies := make(chan signatureReply, others.Len()) // never blocks a sender
+	if others.Len() > 0 && weight.Cmp(new(big.Int).SetUint64(need)) < 0 {
+		request, err := proto.Marshal(&sdk.SignatureRequest{Message: unsigned.Bytes(), Justification: justification})
+		if err != nil {
+			return nil, nil, err
+		}
+		onReply := func(_ context.Context, nodeID ids.NodeID, response []byte, err error) {
+			i, ok := nodeIndex[nodeID]
+			if !ok || err != nil {
+				select {
+				case replies <- signatureReply{index: -1}:
+				default:
+				}
+				return
+			}
+			var r sdk.SignatureResponse
+			var sig *bls.Signature
+			if proto.Unmarshal(response, &r) == nil {
+				if s, err := bls.SignatureFromBytes(r.Signature); err == nil && bls.Verify(vdrs.Validators[i].PublicKey, s, unsigned.Bytes()) {
+					sig = s
+				}
+			}
+			reply := signatureReply{index: -1}
+			if sig != nil {
+				reply = signatureReply{index: i, sig: sig}
+			}
+			select {
+			case replies <- reply:
+			default: // nobody is waiting any more
+			}
+		}
+		if err := m.client.AppRequest(ctx, others, request, onReply); err != nil {
+			return nil, nil, fmt.Errorf("asking the other validators: %w", err)
+		}
+		for answered := 0; answered < others.Len() && weight.Cmp(new(big.Int).SetUint64(need)) < 0; answered++ {
+			select {
+			case <-ctx.Done():
+				answered = others.Len()
+			case r := <-replies:
+				if r.sig != nil {
+					add(r.index, r.sig)
+				}
+			}
+		}
+	}
+	if len(sigs) == 0 {
+		return nil, nil, errors.New("no validator signed")
+	}
+	agg, err := bls.AggregateSignatures(sigs)
+	if err != nil {
+		return nil, nil, err
+	}
+	sig := &warp.BitSetSignature{Signers: bits.Bytes()}
+	copy(sig.Signature[:], bls.SignatureToBytes(agg))
+	msg, err := warp.NewMessage(unsigned, sig)
+	return msg, weight, err
 }
 
 // requiredWeight is the least signing weight the P-Chain accepts out of
@@ -284,8 +370,7 @@ func newValidatorManager(vm *VM, network *p2p.Network, admins set.Set[ids.ShortI
 	if err := network.AddHandler(acp118.HandlerID, acp118.NewHandler(m, vm.ctx.WarpSigner)); err != nil {
 		return nil, fmt.Errorf("registering the signature handler: %w", err)
 	}
-	client := network.NewClient(acp118.HandlerID, vm.p2pValidators)
-	m.aggregator = acp118.NewSignatureAggregator(vm.ctx.Log, client)
+	m.client = network.NewClient(acp118.HandlerID, vm.p2pValidators)
 	return m, nil
 }
 
