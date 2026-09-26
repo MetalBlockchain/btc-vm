@@ -129,7 +129,13 @@ WantedBy=multi-user.target
 EOF
 
 # The node syncs only the P-Chain; deploy/mainnet.sh adds --track-subnets
-# once the L1 exists. Its APIs listen on localhost only.
+# once the L1 exists, and a re-run here keeps it: without it the node stops
+# running the L1, which then has no validator. Its APIs listen on
+# localhost only.
+TRACK=""
+if [[ -f $STATE/chain.json ]]; then
+  TRACK="--track-subnets=$(jq -r .subnetID "$STATE/chain.json") "
+fi
 cat >/etc/systemd/system/metal-mainnet.service <<EOF
 [Unit]
 Description=Metal Blockchain mainnet node (BTCVM L1 validator)
@@ -139,7 +145,7 @@ After=network-online.target
 User=btcvm
 Environment=HOME=$HOME_DIR
 WorkingDirectory=$HOME_DIR
-ExecStart=$HOME_DIR/metalgo/build/metalgo --network-id=mainnet --partial-sync-primary-network=true --data-dir=$STATE/node --log-dir=$STATE/logs --plugin-dir=$STATE/plugins --chain-config-dir=$STATE/chain-configs --http-host=127.0.0.1 --http-port=9660 --staking-port=9661 --public-ip=$IP
+ExecStart=$HOME_DIR/metalgo/build/metalgo --network-id=mainnet --partial-sync-primary-network=true --data-dir=$STATE/node --log-dir=$STATE/logs --plugin-dir=$STATE/plugins --chain-config-dir=$STATE/chain-configs --http-host=127.0.0.1 --http-port=9660 --staking-port=9661 ${TRACK}--public-ip=$IP
 Restart=on-failure
 # SIGTERM to metalgo only: it shuts each chain down in order, and the
 # BTCVM plugin closes its database. Sent to the whole unit, the signal
