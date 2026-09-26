@@ -130,6 +130,12 @@ other signers read out. An agent can't confirm a fingerprint for itself.
   chains show the key has signed). `btcvm signer-log check` lists what a
   log lacks without changing anything; run it before upgrading a signer.
 
+A payout's or refund's fee rate is chosen by the coordinator and comes out
+of the payout, so the policy's range isn't enough: each signer also refuses
+a rate above twice its own Bitcoin node's estimate (`-fee-tolerance`, in
+percent; with no estimate, only the policy's minimum) and above its own
+`-fee-rate-cap` in sat/vB, if set.
+
 The policy is part of the signer set, so the coordinator and every signer
 use the same one. A policy flag that disagrees with it is an error.
 Changing the policy, such as raising a cap, means a new set that every

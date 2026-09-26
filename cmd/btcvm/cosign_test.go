@@ -21,6 +21,8 @@ type cosignHarness struct {
 	*harness
 	signers []*cosigner
 	servers []*httptest.Server
+	// signerEstimate is the fee rate the signers' own nodes estimate.
+	signerEstimate int64
 }
 
 func publicOnly(t *testing.T, s *signerSet) *signerSet {
@@ -30,7 +32,7 @@ func publicOnly(t *testing.T, s *signerSet) *signerSet {
 }
 
 func newCosignHarness(t *testing.T) *cosignHarness {
-	h := &cosignHarness{harness: newHarness(t)}
+	h := &cosignHarness{harness: newHarness(t), signerEstimate: 1000}
 	full := h.b.signers
 	h.b.signers = publicOnly(t, full)
 	for i, key := range full.privKeys {
@@ -38,6 +40,7 @@ func newCosignHarness(t *testing.T) *cosignHarness {
 		own := *h.b // same policy and chains
 		own.signers = publicOnly(t, full)
 		own.cosigners = nil
+		own.feeRate = func() (int64, error) { return h.signerEstimate, nil }
 		own.registry = &depositRegistry{path: filepath.Join(dir, "deposits.json")}
 		log, err := createSigningLog(filepath.Join(dir, "signing-log.json"))
 		require.NoError(t, err)

@@ -448,6 +448,11 @@ type cosigner struct {
 	// open accepts unauthenticated requests: only on loopback, where the
 	// coordinator runs on the same machine.
 	open bool
+	// feeTolerance is how far above this signer's own fee estimate, in
+	// percent of it, a Bitcoin transaction's fee rate may be (0: 200).
+	// feeRateCap is the most it signs for in sat/vB, whatever the estimate
+	// or policy say (0: the policy's maximum).
+	feeTolerance, feeRateCap int64
 
 	mu sync.Mutex // one proposal at a time
 	// mine holds chain transactions found to carry this signer's signature
@@ -739,8 +744,8 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 		if req.Chain != chainBitcoin {
 			return nil, nil, 0, fmt.Errorf("a %s is a Bitcoin transaction", req.Action.Kind)
 		}
-		if req.FeeRate < b.minFeeRate || req.FeeRate > b.maxFeeRate {
-			return nil, nil, 0, fmt.Errorf("fee rate %d sat/vB is outside %d-%d", req.FeeRate, b.minFeeRate, b.maxFeeRate)
+		if err := c.checkFeeRate(req.FeeRate); err != nil {
+			return nil, nil, 0, err
 		}
 		// An action already done by a transaction still unconfirmed may be
 		// done again only by replacing it: same inputs, higher fee.
@@ -861,6 +866,42 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 		return nil, nil, 0, fmt.Errorf("signing would exceed this signer's %s BTC daily limit", formatBTC(c.maxDaily))
 	}
 	return tx, prev, value, nil
+}
+
+// defaultFeeTolerance lets a fee rate reach twice this signer's estimate:
+// two nodes' estimates differ, but not by that much.
+const defaultFeeTolerance = 200
+
+// checkFeeRate bounds the fee rate of a Bitcoin payout or refund. The
+// policy's range alone would let a compromised coordinator make every payout
+// pay its maximum, which comes out of the payout, so the rate must also be
+// within the tolerance of this signer's own node's estimate (or the policy's
+// minimum, if its node has none), and under this signer's own cap.
+func (c *cosigner) checkFeeRate(rate int64) error {
+	b := c.b
+	if rate < b.minFeeRate || rate > b.maxFeeRate {
+		return fmt.Errorf("fee rate %d sat/vB is outside %d-%d", rate, b.minFeeRate, b.maxFeeRate)
+	}
+	if c.feeRateCap > 0 && rate > c.feeRateCap {
+		return fmt.Errorf("fee rate %d sat/vB is above this signer's cap of %d", rate, c.feeRateCap)
+	}
+	tolerance := c.feeTolerance
+	if tolerance <= 0 {
+		tolerance = defaultFeeTolerance
+	}
+	ceiling, basis := b.minFeeRate, "the policy's minimum, as this signer's node has no fee estimate"
+	if b.feeRate != nil {
+		if est, err := b.feeRate(); err == nil {
+			ceiling = max(ceiling, (est*tolerance+99)/100)
+			basis = fmt.Sprintf("%d%% of this signer's estimate of %d", tolerance, est)
+		} else {
+			b.logf("fee estimate: %v", err)
+		}
+	}
+	if rate > ceiling {
+		return fmt.Errorf("fee rate %d sat/vB is above %d, %s", rate, ceiling, basis)
+	}
+	return nil
 }
 
 // catchUp handles a signer that started watching a deposit address after a
@@ -1228,6 +1269,8 @@ func cmdSigner(args []string) error {
 	tokenFile := fs.String("token-file", "", "file holding the token the coordinator must present")
 	approvals := fs.String("refund-approvals", "", `file of approved refunds, "TXID:VOUT BITCOIN-ADDRESS" per line`)
 	maxDaily := fs.Int64("max-daily", 0, "most BTC, in satoshis, this signer approves moving in 24 hours (0: no limit)")
+	feeTolerance := fs.Int64("fee-tolerance", defaultFeeTolerance, "highest Bitcoin fee rate signed, in percent of this signer's own node's estimate")
+	feeRateCap := fs.Int64("fee-rate-cap", 0, "highest Bitcoin fee rate signed, in sat/vB, whatever the estimate (0: the policy's maximum)")
 	rescan := fs.Bool("rescan", false, "rescan Bitcoin for past payments to the peg and registered deposit addresses")
 	s.register(fs)
 	b := bridgeFlags(fs)
@@ -1274,7 +1317,8 @@ func cmdSigner(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cosigner{b: b, key: key, log: log, refundApprovals: *approvals, maxDaily: *maxDaily}
+	c := &cosigner{b: b, key: key, log: log, refundApprovals: *approvals, maxDaily: *maxDaily,
+		feeTolerance: *feeTolerance, feeRateCap: *feeRateCap}
 	// Before serving anything, the log must hold everything the chains show
 	// this key signed. A node still syncing can't say yet; the same check
 	// runs before every signature.

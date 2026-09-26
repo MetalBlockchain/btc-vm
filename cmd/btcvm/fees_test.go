@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/MetalBlockchain/btcvm/btcd/chaincfg/chainhash"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/MetalBlockchain/btcvm/btcd/btcutil"
 	"github.com/MetalBlockchain/btcvm/btcd/chaincfg"
+	"github.com/MetalBlockchain/btcvm/btcd/chaincfg/chainhash"
 	"github.com/MetalBlockchain/btcvm/btcd/wire"
 )
 
@@ -546,4 +547,46 @@ func TestReleaseKeepsSmallChange(t *testing.T) {
 		}
 		require.Equal(extra, change, "change of %d returns to the reserve", extra)
 	}
+}
+
+// TestSignerBoundsFeeRateByItsOwnEstimate: a coordinator can choose any fee
+// rate in the policy's range, and the fee comes out of the payout, so each
+// signer also holds the rate to its own node's estimate and its own cap.
+func TestSignerBoundsFeeRateByItsOwnEstimate(t *testing.T) {
+	require := require.New(t)
+	h := newCosignHarness(t)
+	h.b.minFeeRate, h.b.maxFeeRate = 1, 100
+	for _, c := range h.signers {
+		c.b.minFeeRate, c.b.maxFeeRate = 1, 100
+	}
+	h.signerEstimate = 5
+	rate := int64(100) // a compromised coordinator: the policy's maximum
+	h.b.feeRate = func() (int64, error) { return rate, nil }
+
+	alice, aliceOnBTC := h.user(1), h.user(2)
+	h.deposit(100*btc, &alice, 6)
+	require.NotEmpty(h.step())
+	h.vm.mine()
+	h.pegOut(40*btc, aliceOnBTC)
+	sent := len(h.btc.txs)
+	_, err := h.b.step()
+	require.ErrorContains(err, "above 10, 200% of this signer's estimate of 5")
+	require.Len(h.btc.txs, sent, "nothing was signed")
+
+	rate = 10 // twice the signers' estimate
+	require.NotEmpty(h.step())
+	require.Equal(int64(10), h.b.feeRateOf(h.lastBTC(), h.spends(h.lastBTC())))
+
+	c := h.signers[0]
+	c.feeRateCap = 8
+	require.ErrorContains(c.checkFeeRate(10), "above this signer's cap of 8")
+	require.NoError(c.checkFeeRate(8))
+	c.feeRateCap, c.feeTolerance = 0, 300
+	require.NoError(c.checkFeeRate(15))
+	require.Error(c.checkFeeRate(16))
+
+	// A node with no estimate signs only the policy's minimum.
+	c.b.feeRate = func() (int64, error) { return 0, errors.New("no fee estimate yet") }
+	require.NoError(c.checkFeeRate(1))
+	require.ErrorContains(c.checkFeeRate(2), "no fee estimate")
 }

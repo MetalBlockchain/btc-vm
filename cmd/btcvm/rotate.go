@@ -307,8 +307,8 @@ func (c *cosigner) checkMigrate(s *pegState, req signRequest, tx *wire.MsgTx, pi
 	rate := req.FeeRate
 	if req.Chain == chainBTCVM {
 		coins, rate = s.legacyReserve, 0
-	} else if rate < b.minFeeRate || rate > b.maxFeeRate {
-		return nil, nil, nil, fmt.Errorf("fee rate %d sat/vB is outside %d-%d", rate, b.minFeeRate, b.maxFeeRate)
+	} else if err := c.checkFeeRate(rate); err != nil {
+		return nil, nil, nil, err
 	}
 	var mine []utxo
 	unspent := map[wire.OutPoint]bool{}
