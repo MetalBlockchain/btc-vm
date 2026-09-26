@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/MetalBlockchain/btcvm/btcd/wire"
 )
 
 func TestMissingSigningLogQuarantines(t *testing.T) {
@@ -84,4 +87,55 @@ func TestStaleSigningLogQuarantines(t *testing.T) {
 	require.ErrorIs(restarted.fence(s), errQuarantined)
 	require.NoError(os.Remove(quarantinePath(signer.log.path)))
 	require.NoError(restarted.fence(s))
+}
+
+// TestAdoptRebuildsALogFromTheChains: a key that signed before signers kept
+// logs gets its confirmed signatures logged under the actions they did; an
+// unconfirmed one is never adopted.
+func TestAdoptRebuildsALogFromTheChains(t *testing.T) {
+	require := require.New(t)
+	h := newCosignHarness(t)
+	signer := h.signers[0]
+	empty, err := os.ReadFile(signer.log.path)
+	require.NoError(err)
+	alice, aliceOnBTC := h.user(1), h.user(2)
+	_, err = registerDeposit(h.b, alice)
+	require.NoError(err)
+	d := h.personalDeposit(100*btc, alice, 6)
+	require.NotEmpty(h.step())
+	h.vm.mine()
+	h.pegOut(60*btc, aliceOnBTC)
+	require.NotEmpty(h.step())
+	current, err := os.ReadFile(signer.log.path)
+	require.NoError(err)
+
+	// The payout isn't in a block yet: nothing is adopted.
+	restoreLog(t, signer, empty)
+	s, err := h.b.load()
+	require.NoError(err)
+	_, err = signer.adopt(s)
+	require.ErrorContains(err, "not in a block")
+	reread, err := openSigningLog(signer.log.path)
+	require.NoError(err)
+	require.Empty(reread.Actions, "nothing written")
+
+	// Once it is, both are adopted, under the actions the signer logged.
+	h.btc.mine()
+	s, err = h.b.load()
+	require.NoError(err)
+	adopted, err := signer.adopt(s)
+	require.NoError(err)
+	require.Len(adopted, 2)
+	require.NoError(signer.fence(s))
+	var want signingLog
+	require.NoError(json.Unmarshal(current, &want))
+	reread, err = openSigningLog(signer.log.path)
+	require.NoError(err)
+	for key, a := range want.Actions {
+		require.Contains(reread.Actions, key)
+		require.Equal(a.Txs[0].Txid, reread.Actions[key].Txs[0].Txid)
+	}
+	releaseKey, err := (action{Kind: actionRelease, Deposit: wire.OutPoint{Hash: d.TxHash()}.String()}).key()
+	require.NoError(err)
+	require.True(reread.has(releaseKey))
 }

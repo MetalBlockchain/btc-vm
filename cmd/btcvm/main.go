@@ -65,7 +65,7 @@ Bridge (peg signers):
   btcvm signer-setup STEP                    set up separate signers: init, coordinator, assemble, join, check
   btcvm signer-key -out FILE                 new key for one separate signer; prints its public key
   btcvm signer -signers FILE -key-file FILE  run one separate signer (see docs/SIGNERS.md)
-  btcvm signer-log check|init -signers FILE -key-file FILE
+  btcvm signer-log check|init|adopt -signers FILE -key-file FILE
                                              check a signer's log against the chains, or start the
                                              log of a key that has never signed
 

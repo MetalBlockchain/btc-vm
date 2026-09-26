@@ -130,6 +130,67 @@ func (c *cosigner) unlogged(s *pegState) []string {
 	return missing
 }
 
+// adoptedKey is the log key of a transaction's action, read from its tags.
+func adoptedKey(tx *wire.MsgTx) (string, bool) {
+	var a action
+	if op, ok := parseRelease(tx); ok {
+		a = action{Kind: actionRelease, Deposit: op.String()}
+	} else if id, ok := parsePayment(tx); ok {
+		a = action{Kind: actionPayout, PegOut: id.String()}
+	} else if op, ok := parseRefund(tx); ok {
+		a = action{Kind: actionRefund, Deposit: op.String()}
+	} else if isMigrate(tx) {
+		return migrateKey(tx), true
+	} else {
+		return "", false
+	}
+	key, err := a.key()
+	return key, err == nil
+}
+
+// adopt adds to c's log each transaction the chains show this key signed and
+// the log lacks, under the action it did: for a key that signed before
+// signers kept logs (the bridge once signed with every key itself). Only
+// transactions in a block are adopted, dated when they were; one that isn't,
+// or whose action its tags don't say, is left to investigate, and then
+// nothing is written.
+func (c *cosigner) adopt(s *pegState) ([]string, error) {
+	missing := c.unlogged(s)
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	byID := map[string]chainTx{}
+	for _, t := range append(append([]chainTx{}, s.vmTxs...), s.btcTxs...) {
+		byID[t.tx.TxHash().String()] = t
+	}
+	keys := make([]string, len(missing))
+	for i, id := range missing {
+		t := byID[id]
+		if t.confirmations <= 0 {
+			return nil, fmt.Errorf("%s is not in a block: an unlogged signature that may still confirm is never adopted; find out who signed it", id)
+		}
+		key, ok := adoptedKey(t.tx)
+		if !ok {
+			return nil, fmt.Errorf("%s: its tags don't say which action it did", id)
+		}
+		keys[i] = key
+	}
+	for i, id := range missing {
+		t := byID[id]
+		a := c.log.Actions[keys[i]]
+		if a == nil {
+			a = &loggedAction{First: t.time}
+			c.log.Actions[keys[i]] = a
+		}
+		entry := loggedTx{Txid: unsignedHash(t.tx).String()}
+		for _, in := range t.tx.TxIn {
+			entry.Inputs = append(entry.Inputs, in.PreviousOutPoint.String())
+		}
+		a.Txs = append(a.Txs, entry)
+	}
+	return missing, c.log.write()
+}
+
 // txids is every transaction in the log, by its unsigned txid.
 func (l *signingLog) txids() map[string]bool {
 	ids := map[string]bool{}
@@ -199,13 +260,18 @@ func syncDir(dir string) error {
 // signature that the log lacks, and changes nothing: run it before
 // upgrading a signer to a version that quarantines on them.
 //
+// adopt adds to the log (starting it if need be) what the key signed before
+// signers kept logs: every transaction in a block that carries its signature
+// and the log lacks, under the action its tags name. It adopts nothing if
+// any such transaction isn't in a block, or doesn't say its action.
+//
 // init starts a log for a key that has none: a key made before signer keys
 // came with a log, that has never signed. It refuses if the chains show a
 // transaction the key signed: that key's log was lost, and must be restored
 // from a backup instead.
 func cmdSignerLog(args []string) error {
-	const usage = "usage: btcvm signer-log check|init -signers FILE -key-file FILE [-log FILE]"
-	if len(args) == 0 || (args[0] != "init" && args[0] != "check") {
+	const usage = "usage: btcvm signer-log check|init|adopt -signers FILE -key-file FILE [-log FILE]"
+	if len(args) == 0 || (args[0] != "init" && args[0] != "check" && args[0] != "adopt") {
 		return errors.New(usage)
 	}
 	step := args[0]
@@ -234,8 +300,8 @@ func cmdSignerLog(args []string) error {
 		if _, err := os.Lstat(*logPath); err == nil {
 			return fmt.Errorf("%s already exists", *logPath)
 		}
-	} else {
-		var err error
+	} else if _, err := os.Lstat(*logPath); err == nil {
+		// check: a missing log reads as empty, to show what init would find.
 		if log, err = openSigningLog(*logPath); err != nil {
 			return err
 		}
@@ -264,8 +330,17 @@ func cmdSignerLog(args []string) error {
 	}
 	c := &cosigner{b: b, key: key, log: log}
 	missing := c.unlogged(state)
+	if step == "adopt" {
+		adopted, err := c.adopt(state)
+		if err != nil {
+			return err
+		}
+		printJSON(map[string]any{"signingLog": *logPath, "adopted": adopted})
+		return nil
+	}
 	if step == "check" {
-		printJSON(map[string]any{"signingLog": *logPath, "quarantined": c.quarantined(), "unlogged": missing})
+		_, statErr := os.Lstat(*logPath)
+		printJSON(map[string]any{"signingLog": *logPath, "exists": statErr == nil, "quarantined": c.quarantined(), "unlogged": missing})
 		if len(missing) > 0 {
 			return fmt.Errorf("the log lacks %d transaction(s) the chains show this key signed", len(missing))
 		}

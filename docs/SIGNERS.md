@@ -154,7 +154,12 @@ that short form.
   made before logs came with keys, that has never signed, starts one with
   `btcvm signer-log init -signers FILE -key-file FILE` (it refuses if the
   chains show the key has signed). `btcvm signer-log check` lists what a
-  log lacks without changing anything; run it before upgrading a signer.
+  log lacks (a missing log reads as empty) without changing anything; run it
+  before upgrading a signer. A key that signed before signers kept logs (the
+  bridge once signed with every key itself) runs `btcvm signer-log adopt`
+  once: it logs each transaction in a block that carries the key's
+  signature, under the action its tags name, and adopts nothing if any such
+  transaction isn't in a block yet.
 
 Each new deposit address a signer is told about, by `register` or in a
 proposal, is one more address its node watches for good, so a signer
