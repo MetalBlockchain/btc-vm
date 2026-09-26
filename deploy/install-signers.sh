@@ -80,8 +80,10 @@ for src in "${staged[@]}"; do
   user=btcvm-signer-$n
   echo "== $user"
   # A Bitcoin node still syncing fails its check; the others must pass.
-  sudo -u "$user" bash -c "set -a; . /var/lib/$user/signer.env; set +a
-    exec $BIN signer-setup check -dir /var/lib/$user -btc-network $NETWORK -vm-network $NETWORK -btc-wallet $user" 2>&1 |
+  # The check exits non-zero while a node syncs; the verdict below allows
+  # that, so its status is not what counts (pipefail would make it).
+  { sudo -u "$user" bash -c "set -a; . /var/lib/$user/signer.env; set +a
+    exec $BIN signer-setup check -dir /var/lib/$user -btc-network $NETWORK -vm-network $NETWORK -btc-wallet $user" 2>&1 || true; } |
     python3 -c '
 import json, sys
 text = sys.stdin.read()
