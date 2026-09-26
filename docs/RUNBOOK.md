@@ -98,6 +98,35 @@ bv refund -signers $SET $REG $COORD -deposit TXID:VOUT -to BTCADDR
 With separate signers, each operator first adds `TXID:VOUT BTCADDR` to their
 `-refund-approvals` file.
 
+## Blocks lost after a restart
+
+**Sign:** after the Metal node restarts, BTCVM's height is lower than
+before, and the peg alert fires (`locked` below `circulating`), because a
+withdrawal that was paid on Bitcoin is no longer on BTCVM. The chain log shows
+`Detected unclean shutdown` and `repairing accepted chain by height
+{"outerHeight": N, "innerHeight": M}`.
+
+**Cause:** the BTCVM plugin died without shutting down, and btcd lost the
+blocks still in its caches. It happened once, on 26 September 2026 (blocks
+11-13), before three fixes: each accepted block is now written to disk before
+it is accepted, the plugin waits for metalgo to shut it down, and the node's
+unit has `KillMode=mixed`. Check the unit has it after any change.
+
+**Recover** (nothing is lost: metalgo's proposervm keeps its own copy of each
+block, and only moves its pointer back):
+
+1. Pause the bridge (above). Then `systemctl stop metal-mainnet` at once, so
+   no new block overwrites the lost heights.
+2. Copy the node's database, and work on the copy:
+   `cp -a /var/lib/metal-main/node/db /root/incident-DATE/node-db`.
+3. Read the lost blocks' transactions from the copy (build it from this
+   repo: `go build ./cmd/btcvm-blocks`):
+   `btcvm-blocks /root/incident-DATE/node-db/mainnet/v1.4.5 CHAIN-ID M+1 N`.
+4. Start the node, and send each block's non-coinbase transactions with
+   `sendrawtransaction`, in block order, waiting for each to be in a block.
+5. Check the height is back to N, the peg audit matches, and each signer's
+   own `btcvm audit` agrees; then resume.
+
 ## Suspected compromise of the server
 
 1. Pause.
