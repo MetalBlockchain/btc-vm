@@ -556,6 +556,9 @@ type cosigner struct {
 	open bool
 	// nonces are the requests accepted recently, so none is accepted twice.
 	nonces nonceCache
+	// coordinatorPin is the coordinator's transport key pin, when serving
+	// TLS: other operators' keys may only pause (remotepause.go).
+	coordinatorPin string
 	// maxRegistrations is how many new deposit addresses this signer starts
 	// watching in any hour (0: defaultMaxRegistrations); registered holds
 	// when it did, for the last hour.
@@ -578,7 +581,16 @@ func (c *cosigner) handler() http.Handler {
 	mux.HandleFunc("POST /v1/sign", c.authed(c.handleSign))
 	mux.HandleFunc("POST /v1/register", c.authed(c.handleRegister))
 	mux.HandleFunc("GET /v1/status", c.authed(c.handleStatus))
-	return mux
+	mux.HandleFunc("POST /v1/pause", c.handlePause)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Over TLS, an operator's transport key reaches only the pause.
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && c.coordinatorPin != "" &&
+			spkiPin(r.TLS.PeerCertificates[0]) != c.coordinatorPin && r.URL.Path != "/v1/pause" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // authenticate checks a request carries the token, if this signer has one,
@@ -1516,7 +1528,7 @@ func cmdSigner(args []string) error {
 	}
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           c.handler(),
+		Handler:           c.handler(), // reads c.coordinatorPin per request
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      5 * time.Minute,
@@ -1545,7 +1557,15 @@ func cmdSigner(args []string) error {
 			return fmt.Errorf("this signer's transport key %s is not the one on its card (%s)", pin, op.TLSPin)
 		}
 	}
-	srv.TLSConfig = signerTLS(pair, signers.CoordinatorTLS)
+	// Other operators' transport keys may connect too, to pause this signer.
+	var operatorPins []string
+	for _, op := range signers.Operators {
+		if op.TLSPin != "" {
+			operatorPins = append(operatorPins, op.TLSPin)
+		}
+	}
+	c.coordinatorPin = signers.CoordinatorTLS
+	srv.TLSConfig = signerTLS(pair, signers.CoordinatorTLS, operatorPins...)
 	b.logf("signer %s listening on %s (mutual TLS, transport key %s)", hex.EncodeToString(key.PubKey().SerializeCompressed()), *listen, pin)
 	return srv.ListenAndServeTLS("", "")
 }

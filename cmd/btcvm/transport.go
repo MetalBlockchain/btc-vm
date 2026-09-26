@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -114,9 +115,9 @@ func transportFiles(keyFile string) (cert, key string, ok bool) {
 	return cert, key, errC == nil && errK == nil
 }
 
-// pinned accepts a peer only if its certificate's key has pin. Certificates
-// are self-signed, so the pin replaces chain and name checks.
-func pinned(pin string) func([][]byte, [][]*x509.Certificate) error {
+// pinned accepts a peer only if its certificate's key has one of pins.
+// Certificates are self-signed, so the pin replaces chain and name checks.
+func pinned(pins ...string) func([][]byte, [][]*x509.Certificate) error {
 	return func(raw [][]byte, _ [][]*x509.Certificate) error {
 		if len(raw) == 0 {
 			return errors.New("the peer presented no certificate")
@@ -125,21 +126,25 @@ func pinned(pin string) func([][]byte, [][]*x509.Certificate) error {
 		if err != nil {
 			return err
 		}
-		if got := spkiPin(cert); got != pin {
-			return fmt.Errorf("the peer's transport key %s is not the pinned %s", got, pin)
+		got := spkiPin(cert)
+		for _, pin := range pins {
+			if got == pin {
+				return nil
+			}
 		}
-		return nil
+		return fmt.Errorf("the peer's transport key %s is not the pinned %s", got, strings.Join(pins, " or "))
 	}
 }
 
 // signerTLS is a signer's server configuration: its own certificate, and
-// only the pinned coordinator as a client.
-func signerTLS(own tls.Certificate, coordinatorPin string) *tls.Config {
+// as clients only the pinned coordinator and, to pause it, the operators
+// (the handler keeps them to /v1/pause).
+func signerTLS(own tls.Certificate, coordinatorPin string, operatorPins ...string) *tls.Config {
 	return &tls.Config{
 		MinVersion:            tls.VersionTLS13,
 		Certificates:          []tls.Certificate{own},
 		ClientAuth:            tls.RequireAnyClientCert,
-		VerifyPeerCertificate: pinned(coordinatorPin),
+		VerifyPeerCertificate: pinned(append([]string{coordinatorPin}, operatorPins...)...),
 	}
 }
 

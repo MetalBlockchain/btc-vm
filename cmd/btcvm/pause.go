@@ -7,7 +7,9 @@ package main
 // The pause is a file, paused.json, next to the signer set. That makes it
 // something every operator can do alone, for their own process, even when
 // nothing else is working: the coordinator pauses the bridge, and each signer
-// operator can pause their own signer.
+// operator can pause their own signer. Any operator can also pause every
+// signer, with a pause signed by their signer key (remotepause.go); only
+// each signer's own operator resumes it.
 
 import (
 	"encoding/json"
@@ -70,6 +72,7 @@ func cmdPause(args []string) error {
 	fs := flag.NewFlagSet("pause", flag.ExitOnError)
 	target := pauseFlags(fs)
 	reason := fs.String("reason", "", "why, shown on the website and in alerts")
+	remote, keyFile := pauseFlagsRemote(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -80,15 +83,20 @@ func cmdPause(args []string) error {
 	if *reason == "" {
 		return errors.New("-reason is required: it is shown to users and in alerts")
 	}
+	if *remote != "" {
+		if *keyFile == "" {
+			return errors.New("-remote needs -key-file: your signer key signs the pause")
+		}
+		set, err := readSignerSet(path)
+		if err != nil {
+			return err
+		}
+		return cmdPauseRemote(set, *keyFile, *remote, *reason)
+	}
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("no signer set at %s: %w", path, err)
 	}
-	raw, _ := json.MarshalIndent(pauseState{Reason: *reason, Since: time.Now().UTC()}, "", "  ")
-	tmp := pausePath(path) + ".tmp"
-	if err := os.WriteFile(tmp, append(raw, '\n'), 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, pausePath(path)); err != nil {
+	if err := writePause(path, pauseState{Reason: *reason, Since: time.Now().UTC()}); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Paused. Nothing will be signed or paid until: btcvm resume %s\n", targetArgs(fs))
@@ -106,11 +114,35 @@ func cmdResume(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A signed pause made before now is never applied again.
+	raw, _ := json.Marshal(pauseState{Reason: "resumed", Since: time.Now().UTC()})
+	if err := os.WriteFile(resumedPath(path), append(raw, '\n'), 0o644); err != nil {
+		return err
+	}
 	if err := os.Remove(pausePath(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	printJSON(map[string]any{"paused": false})
 	return nil
+}
+
+// writePause pauses the bridge or signer running with the set at
+// signersPath.
+func writePause(signersPath string, p pauseState) error {
+	raw, _ := json.MarshalIndent(p, "", "  ")
+	tmp := pausePath(signersPath) + ".tmp"
+	if err := os.WriteFile(tmp, append(raw, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, pausePath(signersPath)); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(signersPath))
+}
+
+// resumedPath records when the operator last resumed.
+func resumedPath(signersPath string) string {
+	return filepath.Join(filepath.Dir(signersPath), "resumed.json")
 }
 
 // targetArgs repeats the -signers or -dir flag given, for the resume hint.

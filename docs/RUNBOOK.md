@@ -47,6 +47,15 @@ With separate signers, each operator can also pause their own signer:
 the required number of signers are available, nothing moves. A pause is the
 one power every operator has on their own.
 
+Any operator can also pause **every** signer, without the coordinator:
+`btcvm pause -dir /var/lib/btcvm-signer -remote all -key-file
+/var/lib/btcvm-signer/signer.key -reason "..."` signs the pause with their
+signer key and sends it to each signer on the set's cards (or `-remote
+URL,URL`), and says which it reached. A signer applies a pause signed by a
+key of its set, dated within 10 minutes of its clock and after it was last
+resumed. Only each signer's own operator resumes it, with `btcvm resume
+-dir`, so a stolen operator key can stop the peg but never restart it.
+
 **What a pause does not do.** It stops the software. It does not stop
 someone who has stolen the keys. While all three signer keys are on one
 server, a compromise of that server exposes them all, and the beta caps
