@@ -62,7 +62,7 @@ A peg reserve, created by consensus in the chain's first block and locked to an 
 
 The peg is federated: the signers are trusted. See [docs/BRIDGE.md](docs/BRIDGE.md) for the design, message format and trust model.
 
-The signers can run separately, each with one key on its own machine, checking every transaction against its own view of both chains before signing. A compromised bridge process can then delay transfers but can't move locked BTC. See [docs/SIGNERS.md](docs/SIGNERS.md).
+The signers can run separately, each with one key on its own machine, checking every transaction against its own view of both chains before signing. A compromised bridge process can then delay transfers but can't move locked BTC. See [docs/SIGNERS.md](docs/SIGNERS.md). A key rotation moves the peg to a new set of signers ([docs/ROTATION.md](docs/ROTATION.md)).
 
 ## Status and roadmap
 

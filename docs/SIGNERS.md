@@ -169,8 +169,7 @@ changing the peg address:
 
 Keys that were once stored together were exposed together. The stronger
 step is to rotate: make new keys on each signer's machine and move the
-locked BTC and the reserve to a new signer set. The bridge doesn't support
-moving to a new set yet; that is the next piece of work.
+locked BTC and the reserve to a new signer set ([ROTATION.md](ROTATION.md)).
 
 ## Secrets
 

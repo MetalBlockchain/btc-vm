@@ -137,8 +137,8 @@ block, and only moves its pointer back):
 4. Take a fresh backup (`btcvm-backup run`), and keep the server as it is
    for investigation.
 5. Rebuild on a new server from backup (below). Treat every key that was on
-   the old server as exposed: move the funds to new keys as soon as key
-   rotation exists.
+   the old server as exposed: rotate to new keys, made on other
+   machines ([ROTATION.md](ROTATION.md)).
 
 ## Restore from backup
 
