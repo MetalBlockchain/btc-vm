@@ -33,6 +33,9 @@ type bridge struct {
 	// what this process cannot sign with the keys in signers.
 	cosigners     []*remoteSigner
 	cosignersPath string
+	// coordinatorTLSCert and coordinatorTLSKey are the coordinator's
+	// transport key pair, for signers over TLS (transport.go).
+	coordinatorTLSCert, coordinatorTLSKey string
 	// told records, per signer URL, the deposit destinations that signer
 	// has confirmed it watches (see syncSigners).
 	told               map[string]map[string]bool

@@ -48,16 +48,23 @@ type operatorCard struct {
 	Name      string `json:"name"`
 	URL       string `json:"url"` // where the coordinator reaches the signer
 	PublicKey string `json:"publicKey"`
-	Proof     string `json:"proof"` // signature over the rest, by the key
+	// TLSPin is the signer's transport key pin, for an https URL
+	// (transport.go); absent on cards made before transport keys.
+	TLSPin string `json:"tlsPin,omitempty"`
+	Proof  string `json:"proof"` // signature over the rest, by the key
 }
 
 func (c operatorCard) digest() []byte {
-	sum := sha256.Sum256([]byte("btcvm signer card v1\n" + c.Name + "\n" + c.URL + "\n" + c.PublicKey))
+	msg := "btcvm signer card v1\n" + c.Name + "\n" + c.URL + "\n" + c.PublicKey
+	if c.TLSPin != "" {
+		msg = "btcvm signer card v2\n" + c.Name + "\n" + c.URL + "\n" + c.PublicKey + "\n" + c.TLSPin
+	}
+	sum := sha256.Sum256([]byte(msg))
 	return sum[:]
 }
 
-func makeCard(name, signerURL string, key *btcec.PrivateKey) operatorCard {
-	c := operatorCard{Name: name, URL: signerURL, PublicKey: hex.EncodeToString(key.PubKey().SerializeCompressed())}
+func makeCard(name, signerURL, tlsPin string, key *btcec.PrivateKey) operatorCard {
+	c := operatorCard{Name: name, URL: signerURL, TLSPin: tlsPin, PublicKey: hex.EncodeToString(key.PubKey().SerializeCompressed())}
 	c.Proof = hex.EncodeToString(ecdsa.Sign(key, c.digest()).Serialize())
 	return c
 }
@@ -287,8 +294,12 @@ func setupInit(args []string) error {
 	if err := p.value(signerURL, "url", "URL the coordinator will reach this signer at", ""); err != nil {
 		return err
 	}
-	if u, err := url.Parse(*signerURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+	u, err := url.Parse(*signerURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return fmt.Errorf("%q is not an http(s) URL", *signerURL)
+	}
+	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
+		return fmt.Errorf("%q: a signer beyond the coordinator's machine is reached over https (with its transport key pinned), never plain http", *signerURL)
 	}
 	keyPath := filepath.Join(*dir, keyFileName)
 	if _, err := os.Stat(keyPath); err == nil {
@@ -353,7 +364,14 @@ func setupInit(args []string) error {
 	if _, err := createSigningLog(filepath.Join(*dir, signingLogKey)); err != nil {
 		return err
 	}
-	card := makeCard(*name, *signerURL, key)
+	// So is the transport key, for a signer reached over https.
+	tlsPin := ""
+	if u.Scheme == "https" {
+		if tlsPin, err = makeTransportKey(*dir, "btcvm signer "+*name); err != nil {
+			return err
+		}
+	}
+	card := makeCard(*name, *signerURL, tlsPin, key)
 	raw, _ := json.MarshalIndent(card, "", "  ")
 	cardPath := filepath.Join(*dir, cardFileName)
 	if err := writeNew(cardPath, append(raw, '\n'), 0o644); err != nil {
@@ -389,8 +407,13 @@ func setupCoordinator(args []string) error {
 		return err
 	}
 	pub := hex.EncodeToString(key.PubKey().SerializeCompressed())
-	fmt.Fprintf(p.out, "Coordinator key written to %s. Pass its public key to signer-setup assemble.\n", path)
-	printJSON(map[string]string{"keyFile": path, "coordinatorKey": pub})
+	// Its transport key, for signers reached over TLS.
+	pin, err := makeTransportKey(*dir, "btcvm coordinator")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(p.out, "Coordinator key written to %s. Pass its public key and TLS pin to signer-setup assemble.\n", path)
+	printJSON(map[string]string{"keyFile": path, "coordinatorKey": pub, "coordinatorTLS": pin})
 	return nil
 }
 
@@ -399,6 +422,7 @@ func setupAssemble(args []string) error {
 	fs := flag.NewFlagSet("signer-setup assemble", flag.ExitOnError)
 	req := fs.Int("required", 0, "signatures required to move funds")
 	coordKey := fs.String("coordinator-key", "", "the coordinator's public key (from signer-setup coordinator)")
+	coordTLS := fs.String("coordinator-tls", "", "the coordinator's transport key pin (from signer-setup coordinator), needed if any signer is reached over https")
 	out := fs.String("out", "signers.json", "file to write the signer set to")
 	cosignersOut := fs.String("cosigners-out", "cosigners.json", "file to write the coordinator's list of signers to")
 	previous := fs.String("previous", "", "for a key rotation: the signer set this one replaces (docs/ROTATION.md)")
@@ -431,6 +455,7 @@ func setupAssemble(args []string) error {
 	set := &signerSet{
 		Networks:       &setNetworks{Bitcoin: s.btcNet, BTCVM: s.vmNetwork},
 		CoordinatorKey: *coordKey,
+		CoordinatorTLS: *coordTLS,
 		Policy: &pegPolicy{
 			Confirmations: b.depositConfirmations, VMFee: b.vmFee,
 			MinFeeRate: b.minFeeRate, MaxFeeRate: b.maxFeeRate,
@@ -455,7 +480,10 @@ func setupAssemble(args []string) error {
 		seen[card.PublicKey] = true
 		set.Operators = append(set.Operators, card)
 		set.PublicKeys = append(set.PublicKeys, card.PublicKey)
-		cosigners = append(cosigners, &remoteSigner{URL: card.URL, PublicKey: card.PublicKey})
+		cosigners = append(cosigners, &remoteSigner{URL: card.URL, PublicKey: card.PublicKey, TLSPin: card.TLSPin})
+		if card.TLSPin != "" && set.CoordinatorTLS == "" {
+			return fmt.Errorf("%s: this signer is reached over TLS, so the set needs -coordinator-tls (from signer-setup coordinator)", path)
+		}
 	}
 	if *req == 0 && p.interactive {
 		def := fmt.Sprint(len(set.PublicKeys)/2 + 1)
@@ -497,7 +525,7 @@ func setupAssemble(args []string) error {
 			}
 		}
 		for _, op := range replaces.Operators {
-			cosigners = append(cosigners, &remoteSigner{URL: op.URL, PublicKey: op.PublicKey})
+			cosigners = append(cosigners, &remoteSigner{URL: op.URL, PublicKey: op.PublicKey, TLSPin: op.TLSPin})
 		}
 		if err := set.load(); err != nil {
 			return err
@@ -812,12 +840,17 @@ func setupCheck(args []string) error {
 		}
 		add("Bitcoin node", err, fmt.Sprintf("synced to block %d", chainInfo.Blocks))
 	}
-	if *signerURL == "" {
-		if card, err := readCard(filepath.Join(*dir, cardFileName)); err == nil {
+	pin := ""
+	if card, err := readCard(filepath.Join(*dir, cardFileName)); err == nil {
+		pin = card.TLSPin
+		if *signerURL == "" {
 			*signerURL = card.URL
 		}
 	}
-	if *signerURL != "" && keyErr == nil {
+	if *signerURL != "" && keyErr == nil && pin != "" {
+		err := probeTLS(*signerURL, pin)
+		add("signer service", err, "answering at "+*signerURL+" with its pinned transport key, and refusing clients without the coordinator's")
+	} else if *signerURL != "" && keyErr == nil {
 		// Unauthenticated, the signer should refuse; any answer shows it is up.
 		r := &remoteSigner{URL: strings.TrimRight(*signerURL, "/")}
 		err := r.status(&map[string]any{})

@@ -63,9 +63,9 @@ when something is missing.
 
 | Who | Step | What it does |
 | --- | --- | --- |
-| Each operator | `signer-setup init` | Makes a key on this machine, or imports one (pasted at a hidden prompt, or read with `-import-key-file` or `-import-key-stdin`, never from a flag). Writes a **signer card**: name, URL, public key, and a signature proving the operator holds the key. |
-| Coordinator | `signer-setup coordinator` | Makes the coordinator key, which signs every request to the signers. |
-| Coordinator | `signer-setup assemble CARD...` | Checks every card and builds the **signer set**: the keys, how many must sign, the networks, the coordinator key and the bridge policy (confirmations, fees, caps). Prints its **fingerprint**. |
+| Each operator | `signer-setup init` | Makes a key on this machine, or imports one (pasted at a hidden prompt, or read with `-import-key-file` or `-import-key-stdin`, never from a flag), with an empty signing log and, for an https URL, a **transport key** (`tls.key`, `tls.crt`). Writes a **signer card**: name, URL, public key, transport key pin, and a signature proving the operator holds the key. |
+| Coordinator | `signer-setup coordinator` | Makes the coordinator key, which signs every request to the signers, and the coordinator's transport key. Prints both public keys (`coordinatorKey`, `coordinatorTLS`). |
+| Coordinator | `signer-setup assemble CARD...` | Checks every card and builds the **signer set**: the keys, how many must sign, the networks, the coordinator key and transport pin, and the bridge policy (confirmations, fees, caps). Prints its **fingerprint**. |
 | Each operator | `signer-setup join` | Shows the set and its fingerprint, which each operator confirms with the others over a separate channel. Then writes the service file and a settings file for the operator's own nodes. |
 | Anyone | `signer-setup check` | Checks the key file, set membership, both nodes (and that Bitcoin Core is synced), and that the signer service is up and refusing unsigned requests. |
 
@@ -78,7 +78,7 @@ btcvm signer-setup init            # asks: name, URL, make a key or import one
 
 # The coordinator (caps in satoshis)
 btcvm signer-setup coordinator
-btcvm signer-setup assemble -required 2 -coordinator-key PUB \
+btcvm signer-setup assemble -required 2 -coordinator-key PUB -coordinator-tls PIN \
   -btc-network mainnet -vm-network mainnet \
   -confirmations 6 -confirmation-tiers "0.001:2,0.005:3" \
   -max-deposit 1000000 -max-circulating 10000000 \
@@ -118,9 +118,13 @@ other signers read out. An agent can't confirm a fingerprint for itself.
   hasn't seen (so none is accepted twice), and be no more than 5 minutes
   old. The coordinator's `cosigners.json` gives each signer's `publicKey`
   (`assemble` writes it; otherwise it comes from the set's card with that
-  URL). The
-  requests and answers carry only public data, so TLS is good practice but
-  not what keeps funds safe.
+  URL).
+  A signer beyond the coordinator's machine is reached only over **mutual
+  TLS with pinned keys**: it serves with its transport key (the pin on its
+  card) and accepts only the coordinator's (the pin in the set); the
+  coordinator accepts only the pinned signer key, and never talks plain
+  HTTP beyond its own machine. Both pins are covered by the fingerprint.
+  The coordinator finds its transport key next to `-coordinator-key-file`.
 - **The signing log** (`signing-log.json`), made with the key by
   `signer-setup init`. Back it up. A signer never runs on a missing log, or
   on one older than what it has signed: at start and before every signature

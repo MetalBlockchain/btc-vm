@@ -37,7 +37,10 @@ type signerSet struct {
 	Networks       *setNetworks   `json:"networks,omitempty"`
 	Operators      []operatorCard `json:"operators,omitempty"`
 	CoordinatorKey string         `json:"coordinatorKey,omitempty"` // hex; signs every request to the signers
-	Policy         *pegPolicy     `json:"policy,omitempty"`
+	// CoordinatorTLS is the pin of the coordinator's transport key, the
+	// only client a signer reached over TLS accepts (transport.go).
+	CoordinatorTLS string     `json:"coordinatorTLS,omitempty"`
+	Policy         *pegPolicy `json:"policy,omitempty"`
 	// Previous are the sets this one replaced, newest first. Coins still
 	// held by them are the peg's too: their signers, now retired, sign only
 	// transactions moving those coins to this set (see rotate.go).
@@ -106,10 +109,11 @@ func (s *signerSet) fingerprint() string {
 		Operators      []operatorCard `json:"operators"`
 		CoordinatorKey string         `json:"coordinatorKey"`
 		Policy         *pegPolicy     `json:"policy"`
-		// Omitted when empty, so sets made before rotation keep their
-		// fingerprint.
-		Previous []priorSet `json:"previous,omitempty"`
-	}{s.Required, s.PublicKeys, s.Networks, s.Operators, s.CoordinatorKey, s.Policy, s.Previous})
+		// Omitted when empty, so sets made before rotation, or before
+		// transport keys, keep their fingerprint.
+		Previous       []priorSet `json:"previous,omitempty"`
+		CoordinatorTLS string     `json:"coordinatorTLS,omitempty"`
+	}{s.Required, s.PublicKeys, s.Networks, s.Operators, s.CoordinatorKey, s.Policy, s.Previous, s.CoordinatorTLS})
 	sum := sha256.Sum256(agreed)
 	h := hex.EncodeToString(sum[:10])
 	return strings.Join([]string{h[0:4], h[4:8], h[8:12], h[12:16], h[16:20]}, "-")

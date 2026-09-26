@@ -209,8 +209,12 @@ type remoteSigner struct {
 	// made for this signer is refused by any other. If absent, it comes
 	// from the signer set's card with this URL.
 	PublicKey string `json:"publicKey,omitempty"`
+	// TLSPin is the signer's transport key pin, for an https URL. If absent,
+	// it comes from the card with this URL (transport.go).
+	TLSPin string `json:"tlsPin,omitempty"`
 
-	auth *btcec.PrivateKey // the coordinator key, if the set names one
+	auth   *btcec.PrivateKey // the coordinator key, if the set names one
+	client *http.Client      // pinned mutual TLS, for an https URL
 }
 
 // Requests to signers are signed with the coordinator key, over the method,
@@ -296,11 +300,15 @@ func readCosigners(path string) ([]*remoteSigner, error) {
 // key is one of the set's or of a set it replaced.
 func (s *signerSet) identifyCosigners(list []*remoteSigner) error {
 	for _, r := range list {
-		if r.PublicKey == "" {
-			for _, op := range s.Operators {
-				if strings.TrimRight(op.URL, "/") == r.URL {
-					r.PublicKey = op.PublicKey
-				}
+		for _, op := range s.Operators {
+			if strings.TrimRight(op.URL, "/") != r.URL {
+				continue
+			}
+			if r.PublicKey == "" {
+				r.PublicKey = op.PublicKey
+			}
+			if r.TLSPin == "" {
+				r.TLSPin = op.TLSPin
 			}
 		}
 		if r.PublicKey == "" {
@@ -354,7 +362,11 @@ func (r *remoteSigner) do(method, path string, body []byte, result any) error {
 	if r.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+r.Token)
 	}
-	resp, err := signerClient.Do(req)
+	client := signerClient
+	if r.client != nil {
+		client = r.client
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1361,6 +1373,8 @@ func cmdSigner(args []string) error {
 	logPath := fs.String("log", "", "signing log (default: signing-log.json next to -key-file); back it up")
 	listen := fs.String("listen", "127.0.0.1:9700", "address to serve the signing API on")
 	tokenFile := fs.String("token-file", "", "file holding the token the coordinator must present")
+	tlsCert := fs.String("tls-cert", "", "this signer's transport certificate (default: tls.crt next to -key-file, if there)")
+	tlsKey := fs.String("tls-key", "", "this signer's transport key (default: tls.key next to -key-file, if there)")
 	approvals := fs.String("refund-approvals", "", `file of approved refunds, "TXID:VOUT BITCOIN-ADDRESS" per line`)
 	maxDaily := fs.Int64("max-daily", 0, "most BTC, in satoshis, this signer approves moving in 24 hours (0: no limit)")
 	feeTolerance := fs.Int64("fee-tolerance", defaultFeeTolerance, "highest Bitcoin fee rate signed, in percent of this signer's own node's estimate")
@@ -1435,17 +1449,13 @@ func cmdSigner(args []string) error {
 	if err != nil {
 		return err
 	}
-	loopback := false
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		loopback = true
-	}
+	loopback := isLoopback(host)
 	switch {
 	case c.token == "" && signers.coordKey == nil && !loopback:
 		return errors.New("listening beyond this machine needs a coordinator key in the signer set, or -token-file")
 	case c.token == "" && signers.coordKey == nil:
 		c.open = true
 	}
-	b.logf("signer %s listening on %s", hex.EncodeToString(key.PubKey().SerializeCompressed()), *listen)
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           c.handler(),
@@ -1453,5 +1463,31 @@ func cmdSigner(args []string) error {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      5 * time.Minute,
 	}
-	return srv.ListenAndServe()
+	if *tlsCert == "" && *tlsKey == "" {
+		if cert, key, ok := transportFiles(*keyFile); ok {
+			*tlsCert, *tlsKey = cert, key
+		}
+	}
+	if *tlsCert == "" {
+		if !loopback {
+			return errors.New("listening beyond this machine needs mutual TLS: a transport key (signer-setup init makes one for an https URL) and the coordinator's pin in the signer set")
+		}
+		b.logf("signer %s listening on %s", hex.EncodeToString(key.PubKey().SerializeCompressed()), *listen)
+		return srv.ListenAndServe()
+	}
+	pair, pin, err := loadTransportKey(*tlsCert, *tlsKey)
+	if err != nil {
+		return err
+	}
+	if signers.CoordinatorTLS == "" {
+		return errors.New("this signer has a transport key, but the signer set names no coordinator transport key (-coordinator-tls at assemble)")
+	}
+	for _, op := range signers.Operators {
+		if op.PublicKey == hex.EncodeToString(key.PubKey().SerializeCompressed()) && op.TLSPin != "" && op.TLSPin != pin {
+			return fmt.Errorf("this signer's transport key %s is not the one on its card (%s)", pin, op.TLSPin)
+		}
+	}
+	srv.TLSConfig = signerTLS(pair, signers.CoordinatorTLS)
+	b.logf("signer %s listening on %s (mutual TLS, transport key %s)", hex.EncodeToString(key.PubKey().SerializeCompressed()), *listen, pin)
+	return srv.ListenAndServeTLS("", "")
 }
