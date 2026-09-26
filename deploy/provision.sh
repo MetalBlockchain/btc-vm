@@ -141,6 +141,10 @@ Environment=HOME=$HOME_DIR
 WorkingDirectory=$HOME_DIR
 ExecStart=$HOME_DIR/metalgo/build/metalgo --network-id=mainnet --partial-sync-primary-network=true --data-dir=$STATE/node --log-dir=$STATE/logs --plugin-dir=$STATE/plugins --chain-config-dir=$STATE/chain-configs --http-host=127.0.0.1 --http-port=9660 --staking-port=9661 --public-ip=$IP
 Restart=on-failure
+# SIGTERM to metalgo only: it shuts each chain down in order, and the
+# BTCVM plugin closes its database. Sent to the whole unit, the signal
+# killed the plugin first and lost accepted blocks.
+KillMode=mixed
 TimeoutStopSec=120
 LimitNOFILE=65536
 

@@ -75,11 +75,14 @@ func btcvmMain() error {
 		errChan <- rpcchainvm.Serve(ctx, &vm.VM{})
 	}()
 
-	// Wait for either interrupt or error
+	// metalgo owns this process: it calls the VM's Shutdown, which flushes
+	// and closes the chain database, and then the server returns. A signal
+	// (systemd sends SIGTERM to every process in the unit) must not end the
+	// process first: exiting here skipped Shutdown, and btcd lost the
+	// blocks still in its caches, which Snowman had already accepted.
 	select {
 	case <-interrupt:
-		log.Info("Received interrupt signal, shutting down gracefully")
-		return nil
+		log.Info("Received a stop signal; waiting for metalgo to shut the VM down")
 	case err := <-errChan:
 		if err != nil {
 			log.Error("RPC chain VM server error", "error", err)
@@ -87,6 +90,11 @@ func btcvmMain() error {
 		}
 		return nil
 	}
+	if err := <-errChan; err != nil {
+		log.Error("RPC chain VM server error", "error", err)
+		return err
+	}
+	return nil
 }
 
 func main() {

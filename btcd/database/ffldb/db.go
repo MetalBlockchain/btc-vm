@@ -2037,6 +2037,26 @@ func (db *db) Update(fn func(database.Tx) error) error {
 //
 // This function is part of the database.DB interface implementation.
 func (db *db) Close() error {
+	return db.close()
+}
+
+// Flush writes the cache to the underlying database now, the same flush btcd
+// otherwise runs every few minutes or when the cache fills. BTCVM calls it
+// after each accepted block: an accepted block is final, and must not sit in
+// a cache the process could die with. It holds the write lock, as a write
+// transaction's flush does, so no write runs while the cache is cleared.
+func (db *db) Flush() error {
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
+	db.closeLock.RLock()
+	defer db.closeLock.RUnlock()
+	if db.closed {
+		return makeDbErr(database.ErrDbNotOpen, errDbNotOpenStr, nil)
+	}
+	return db.cache.flush()
+}
+
+func (db *db) close() error {
 	// Since all transactions have a read lock on this mutex, this will
 	// cause Close to wait for all readers to complete.
 	db.closeLock.Lock()

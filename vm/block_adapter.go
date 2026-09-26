@@ -206,6 +206,11 @@ func (b *BlockAdapter) accept() error {
 		return fmt.Errorf("accepted block %s did not become the chain tip (orphan=%t, mainChain=%t)",
 			b.id, isOrphan, isMainChain)
 	}
+	// Accepted is final: write it to disk before saying so, so a crash or
+	// a kill can't take it back.
+	if err := b.vm.btcdAdapter.Persist(); err != nil {
+		return fmt.Errorf("failed to persist accepted block %s: %w", b.id, err)
+	}
 
 	delete(b.vm.verifiedBlocks, b.id)
 	b.vm.lastAccepted = b.id
