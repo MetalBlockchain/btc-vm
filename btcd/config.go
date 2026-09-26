@@ -455,7 +455,15 @@ func mergeConfigs(base *Config, override *Config) {
 // command line options.  Command line options always take precedence.
 func LoadConfig(nodeId string, overrideCfg *Config) (*Config, []string, error) {
 	// TODO 2025-12-03: should parse the configBytes as json and merge it with the default at end
-	defaultHomeDir = btcutil.AppDataDir("btcdvm/"+nodeId, false)
+	// btcd's home holds only defaults (a config file, the unused RPC TLS
+	// pair, and data and log dirs when none are given). With a dataDir in
+	// the chain config it lives inside it, so the VM needs no writable home
+	// directory (a service user may have none); without one, the old place.
+	if overrideCfg != nil && overrideCfg.DataDir != "" {
+		defaultHomeDir = filepath.Join(overrideCfg.DataDir, "btcdvm-home")
+	} else {
+		defaultHomeDir = btcutil.AppDataDir("btcdvm/"+nodeId, false)
+	}
 	defaultConfigFile = filepath.Join(defaultHomeDir, defaultConfigFilename)
 	defaultDataDir = filepath.Join(defaultHomeDir, defaultDataDirname)
 	defaultRPCKeyFile = filepath.Join(defaultHomeDir, "rpc.key")

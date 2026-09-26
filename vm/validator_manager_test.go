@@ -6,6 +6,7 @@ package vm
 import (
 	"context"
 	"crypto/sha256"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -166,5 +167,21 @@ func TestParseValidatorAdmins(t *testing.T) {
 	}
 	if _, err := parseValidatorAdmins([]byte(`{"validatorAdmins":["not-an-address"]}`)); err == nil {
 		t.Fatal("accepted a bad address")
+	}
+}
+
+func TestQuorumMatchesThePChain(t *testing.T) {
+	for _, tc := range []struct{ total, need uint64 }{
+		{1, 1}, {2, 2}, {3, 3}, {100, 67}, {200, 134}, {300, 201}, {600, 402}, {101, 68},
+	} {
+		if got := requiredWeight(tc.total); got != tc.need {
+			t.Errorf("requiredWeight(%d) = %d, want %d", tc.total, got, tc.need)
+		}
+		if !quorum(new(big.Int).SetUint64(tc.need), tc.total) {
+			t.Errorf("quorum(%d of %d) = false", tc.need, tc.total)
+		}
+		if tc.need > 0 && quorum(new(big.Int).SetUint64(tc.need-1), tc.total) {
+			t.Errorf("quorum(%d of %d) = true; the P-Chain would reject it", tc.need-1, tc.total)
+		}
 	}
 }

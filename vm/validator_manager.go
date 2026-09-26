@@ -215,7 +215,41 @@ func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, just
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return m.aggregator.AggregateSignatures(ctx, msg, justification, vdrs.Validators, 67, 100)
+	// The P-Chain accepts signed*100 >= total*67 over the whole set's weight.
+	// The aggregator floors total*num/den and returns what it has on a
+	// timeout, so ask it for exactly the weight needed and check the result.
+	need := requiredWeight(vdrs.TotalWeight)
+	var listed uint64
+	for _, v := range vdrs.Validators {
+		listed += v.Weight
+	}
+	if listed < need {
+		return nil, nil, nil, fmt.Errorf("the L1's validators with BLS keys hold weight %d; %d must sign", listed, need)
+	}
+	signed, signedWeight, total, err := m.aggregator.AggregateSignatures(ctx, msg, justification, vdrs.Validators, need, listed)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !quorum(signedWeight, vdrs.TotalWeight) {
+		return nil, nil, nil, fmt.Errorf("only weight %s of %d signed; the P-Chain needs %d (are enough validators online?)", signedWeight, vdrs.TotalWeight, need)
+	}
+	return signed, signedWeight, total, nil
+}
+
+// requiredWeight is the least signing weight the P-Chain accepts out of
+// total: signed*100 >= total*67, rounded up.
+func requiredWeight(total uint64) uint64 {
+	n := new(big.Int).Mul(new(big.Int).SetUint64(total), big.NewInt(67))
+	n.Add(n, big.NewInt(99))
+	n.Div(n, big.NewInt(100))
+	return n.Uint64()
+}
+
+// quorum is the P-Chain's check: signed*100 >= total*67.
+func quorum(signed *big.Int, total uint64) bool {
+	lhs := new(big.Int).Mul(signed, big.NewInt(100))
+	rhs := new(big.Int).Mul(new(big.Int).SetUint64(total), big.NewInt(67))
+	return lhs.Cmp(rhs) >= 0
 }
 
 // errValidatorSetSettling: signatures made now might be checked against

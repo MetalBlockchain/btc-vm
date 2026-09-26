@@ -176,7 +176,7 @@ approve_and_register() {
   "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request$i.json" \
     -key "$DIR/admin.json" -rpc-pass-file "$DIR/rpc-password" >"$DIR/registration$i.json" || return 1
   "$BIN/btcvm-l1" register -registration "$DIR/registration$i.json" -key "$DIR/ewoq.json" \
-    -uri "$(uri 1)" -balance 1 >"$DIR/registered$i.json"
+    -uri "$(uri "$i")" -balance 1 >"$DIR/registered$i.json"
 }
 add_validator() {
   local i=$1 id

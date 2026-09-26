@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/MetalBlockchain/btcvm/btcd/btcutil"
 )
 
 // metalgo starts a plugin with no environment at all (no HOME), in
@@ -43,4 +45,21 @@ func TestVMLeavesWorkingDirectoryAlone(t *testing.T) {
 		require.NoError(err, "%s was removed or moved", name)
 		require.Equal(content, string(got), "%s was changed", name)
 	}
+}
+
+// With a dataDir in the chain config, the VM creates nothing outside it:
+// no btcd home directory under the service user's home, which may not be
+// writable (ProtectHome, or a home of /nonexistent).
+func TestVMCreatesNothingOutsideItsDataDir(t *testing.T) {
+	require := require.New(t)
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	vm := newTestVM(t, dir, nil)
+	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
+
+	// The NodeID is random per test, so its old-style home can't predate it.
+	home := btcutil.AppDataDir("btcdvm/"+vm.ctx.NodeID.String(), false)
+	_, err := os.Stat(home)
+	require.True(os.IsNotExist(err), "the VM created %s outside its dataDir", home)
+	require.DirExists(filepath.Join(dir, "data", "btcdvm-home"))
 }

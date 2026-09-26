@@ -314,6 +314,7 @@ func cmdRegister(args []string) error {
 	keyPath := fs.String("key", "", "the P-Chain key that pays the balance")
 	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
 	balance := fs.Float64("balance", 1, "METAL for the validator's continuous P-Chain fee")
+	otherNode := fs.Bool("other-node", false, "register it even though it isn't for the node at -uri")
 	_ = fs.Parse(args)
 	if *regPath == "" || *keyPath == "" {
 		return errors.New("-registration and -key are required")
@@ -325,6 +326,27 @@ func cmdRegister(args []string) error {
 	signed, err := unhex(reg.SignedMessage, "signedMessage")
 	if err != nil {
 		return err
+	}
+	// Check what's actually signed, not the file's labels: paying for
+	// someone else's validator would hand them the balance.
+	inner, err := registrationIn(signed)
+	if err != nil {
+		return err
+	}
+	nodeID, err := ids.ToNodeID(inner.NodeID)
+	if err != nil {
+		return fmt.Errorf("the signed registration's NodeID: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "registering %s (weight %d); what's left of the balance goes to %v\n",
+		nodeID, inner.Weight, inner.RemainingBalanceOwner.Addresses)
+	if !*otherNode {
+		mine, pop, err := info.NewClient(*uri).GetNodeID(context.Background())
+		if err != nil {
+			return fmt.Errorf("reading the node at -uri (to check the registration is for it): %w", err)
+		}
+		if mine != nodeID || pop == nil || pop.PublicKey != inner.BLSPublicKey {
+			return fmt.Errorf("this registration is for %s, not the node at -uri (%s); -other-node registers it anyway", nodeID, mine)
+		}
 	}
 	popBytes, err := unhex(reg.BLSProofOfPossession, "blsProofOfPossession")
 	if err != nil {
@@ -341,6 +363,19 @@ func cmdRegister(args []string) error {
 		return fmt.Errorf("registering: %w", err)
 	}
 	return printJSON(map[string]string{"nodeID": reg.NodeID, "validationID": reg.ValidationID, "txID": tx.ID().String()})
+}
+
+// registrationIn returns the RegisterL1Validator inside a signed Warp message.
+func registrationIn(signed []byte) (*message.RegisterL1Validator, error) {
+	msg, err := warp.ParseMessage(signed)
+	if err != nil {
+		return nil, fmt.Errorf("not a signed Warp message: %w", err)
+	}
+	call, err := payload.ParseAddressedCall(msg.UnsignedMessage.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("not an addressed call: %w", err)
+	}
+	return message.ParseRegisterL1Validator(call.Payload)
 }
 
 // cmdRemove removes a validator (sets its weight to 0).
