@@ -249,16 +249,14 @@ var rpcUnimplemented = map[string]struct{}{
 }
 
 // Commands that are available to a limited user
+// maxSearchRawTransactionsCount is the most transactions one
+// searchrawtransactions call returns.
+const maxSearchRawTransactionsCount = 500
+
 var rpcLimited = map[string]struct{}{
 	// Websockets commands
-	"loadtxfilter":          {},
-	"notifyblocks":          {},
-	"notifynewtransactions": {},
-	"notifyreceived":        {},
-	"notifyspent":           {},
-	"rescan":                {},
-	"rescanblocks":          {},
-	"session":               {},
+	"notifyblocks": {},
+	"session":      {},
 
 	// Websockets AND HTTP/S commands
 	"help": {},
@@ -282,12 +280,10 @@ var rpcLimited = map[string]struct{}{
 	"getheaders":            {},
 	"getinfo":               {},
 	"getnettotals":          {},
-	"getnetworkhashps":      {},
 	"getrawmempool":         {},
 	"getrawtransaction":     {},
 	"gettxout":              {},
 	"searchrawtransactions": {},
-	"sendrawtransaction":    {},
 	"uptime":                {},
 	"validateaddress":       {},
 	"verifymessage":         {},
@@ -3273,6 +3269,12 @@ func handleSearchRawTransactions(s *rpcServer, cmd any, closeChan <-chan struct{
 		if numRequested < 0 {
 			numRequested = 1
 		}
+	}
+	// A caller's count sizes an allocation before anything is looked up,
+	// and the public read-only user can call this, so bound it: larger
+	// histories are read in pages with skip (the bridge pages at 500).
+	if numRequested > maxSearchRawTransactionsCount {
+		numRequested = maxSearchRawTransactionsCount
 	}
 	if numRequested == 0 {
 		return nil, nil
