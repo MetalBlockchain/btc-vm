@@ -97,3 +97,34 @@ func TestFreshMainnetNodeFollowsChain(t *testing.T) {
 	}
 	require.Equal(a.LastAcceptedID(), b.LastAcceptedID())
 }
+
+// TestFreshNodeParsesGenesisFromPeer: a peer's reply to a joining node's
+// request for blocks runs down to genesis, and the node parses every block
+// in it. Genesis has no BIP34 height in its coinbase, so the node must
+// recognise it as its own rather than fail to parse it (and then ask for the
+// same blocks forever).
+func TestFreshNodeParsesGenesisFromPeer(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	for _, config := range []map[string]any{nil, {
+		"testNet": false, "mainNet": true,
+		"miningAddrs": []string{mainnetMiningAddr(t)},
+	}} {
+		a := setupVMWithConfig(t, config)
+		b := setupVMWithConfig(t, config)
+		genesis, err := a.GetBlock(ctx, a.LastAcceptedID())
+		require.NoError(err)
+		require.Zero(genesis.Height())
+
+		parsed, err := b.ParseBlock(ctx, genesis.Bytes())
+		require.NoError(err, "a fresh node parses genesis bytes from a peer")
+		require.Equal(genesis.ID(), parsed.ID())
+		require.Zero(parsed.Height())
+	}
+}
+
+func mainnetMiningAddr(t *testing.T) string {
+	addr, err := btcutil.NewAddressPubKeyHash(bytes.Repeat([]byte{0x01}, 20), &btcd.BTCVMMainNetParams)
+	require.NoError(t, err)
+	return addr.EncodeAddress()
+}

@@ -99,6 +99,14 @@ func parseBlockAdapter(vm *VM, blockBytes []byte) (*BlockAdapter, error) {
 		return nil, errNonCanonicalBlock
 	}
 
+	// A block this node already has, genesis included, is its own copy.
+	// Genesis has no BIP34 height in its coinbase, and a peer's reply to a
+	// joining node's request for blocks runs down to it: failing to parse it
+	// would make the node discard the reply and ask again forever.
+	if known, err := vm.getBlock(hashToID(block.Hash())); err == nil {
+		return known, nil
+	}
+
 	if len(msgBlock.Transactions) == 0 {
 		return nil, errNoCoinbase
 	}
