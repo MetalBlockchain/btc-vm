@@ -137,7 +137,8 @@ func TestSignerCeremony(t *testing.T) {
 		t.Cleanup(srv.Close)
 		h.signers = append(h.signers, c)
 		h.servers = append(h.servers, srv)
-		h.b.cosigners = append(h.b.cosigners, &remoteSigner{URL: srv.URL, auth: coord})
+		h.b.cosigners = append(h.b.cosigners, &remoteSigner{URL: srv.URL, auth: coord,
+			PublicKey: hex.EncodeToString(key.PubKey().SerializeCompressed())})
 	}
 
 	alice, aliceOnBTC := h.user(1), h.user(2)
@@ -155,19 +156,39 @@ func TestSignerCeremony(t *testing.T) {
 	var status map[string]any
 	unsigned := &remoteSigner{URL: h.servers[0].URL}
 	require.ErrorContains(unsigned.status(&status), "not signed by the coordinator")
-	impostor := &remoteSigner{URL: h.servers[0].URL, auth: h.signers[1].key}
+	impostor := &remoteSigner{URL: h.servers[0].URL, auth: h.signers[1].key, PublicKey: h.b.cosigners[0].PublicKey}
 	require.ErrorContains(impostor.status(&status), "not signed by the coordinator")
 	require.NoError(h.b.cosigners[0].status(&status))
 
+	// signed returns the status request the coordinator would send signer
+	// for, at time unix, with nonce.
+	signed := func(to int, unix int64, nonce string) *http.Request {
+		req, _ := http.NewRequest(http.MethodGet, h.servers[0].URL+"/v1/status", nil)
+		req.Header.Set("X-Btcvm-Time", strconv.FormatInt(unix, 10))
+		req.Header.Set("X-Btcvm-Nonce", nonce)
+		digest := requestDigest("GET", "/v1/status", unix, nonce, h.b.cosigners[to].PublicKey, nil)
+		req.Header.Set("X-Btcvm-Signature", hex.EncodeToString(ecdsaSign(coord, digest)))
+		return req
+	}
+	code := func(req *http.Request) int {
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(err)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	now := time.Now().Unix()
 	// So are stale ones.
-	req, _ := http.NewRequest(http.MethodGet, h.servers[0].URL+"/v1/status", nil)
-	old := time.Now().Add(-time.Hour).Unix()
-	req.Header.Set("X-Btcvm-Time", strconv.FormatInt(old, 10))
-	req.Header.Set("X-Btcvm-Signature", hex.EncodeToString(ecdsaSign(coord, requestDigest("GET", "/v1/status", old, nil))))
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(err)
-	resp.Body.Close()
-	require.Equal(http.StatusUnauthorized, resp.StatusCode)
+	require.Equal(http.StatusUnauthorized, code(signed(0, time.Now().Add(-time.Hour).Unix(), newNonce())))
+	// And ones made for another signer: signer 0 is sent signer 1's.
+	require.Equal(http.StatusUnauthorized, code(signed(1, now, newNonce())))
+	// A request is accepted once; a replay of it is refused.
+	nonce := newNonce()
+	require.Equal(http.StatusOK, code(signed(0, now, nonce)))
+	require.Equal(http.StatusUnauthorized, code(signed(0, now, nonce)))
+	// A request with no nonce, as a coordinator before nonces sent, is refused.
+	legacy := signed(0, now, newNonce())
+	legacy.Header.Del("X-Btcvm-Nonce")
+	require.Equal(http.StatusUnauthorized, code(legacy))
 }
 
 func TestCeremonyRefusesMistakes(t *testing.T) {

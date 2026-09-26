@@ -519,6 +519,9 @@ func (b *bridge) connect(s *settings, signers *signerSet) error {
 		if b.cosigners, err = readCosigners(b.cosignersPath); err != nil {
 			return err
 		}
+		if err := signers.identifyCosigners(b.cosigners); err != nil {
+			return fmt.Errorf("%s: %w", b.cosignersPath, err)
+		}
 	}
 	if b.coordinatorKeyPath != "" {
 		key, err := readKeyFile(b.coordinatorKeyPath)

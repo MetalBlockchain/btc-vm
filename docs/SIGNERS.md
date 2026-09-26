@@ -113,7 +113,12 @@ other signers read out. An agent can't confirm a fingerprint for itself.
   independent: it checks everything against its own nodes. A signer that
   uses someone else's node trusts that node's operator.
 - **The signer service** from `join`. It serves on port 9700. Requests must
-  be signed by the coordinator key and be no more than 5 minutes old. The
+  be signed by the coordinator key, name this signer's public key (so a
+  request made for one signer is refused by the others), carry a nonce it
+  hasn't seen (so none is accepted twice), and be no more than 5 minutes
+  old. The coordinator's `cosigners.json` gives each signer's `publicKey`
+  (`assemble` writes it; otherwise it comes from the set's card with that
+  URL). The
   requests and answers carry only public data, so TLS is good practice but
   not what keeps funds safe.
 - **The signing log** (`signing-log.json`), made with the key by

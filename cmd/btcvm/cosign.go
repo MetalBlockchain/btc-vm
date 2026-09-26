@@ -205,20 +205,66 @@ func (b *bridge) blockHints(p *proposal) map[string]string {
 type remoteSigner struct {
 	URL   string `json:"url"`
 	Token string `json:"token,omitempty"` // optional, for signers run with -token-file
+	// PublicKey is the signer's key, hex. Every request names it, so one
+	// made for this signer is refused by any other. If absent, it comes
+	// from the signer set's card with this URL.
+	PublicKey string `json:"publicKey,omitempty"`
 
 	auth *btcec.PrivateKey // the coordinator key, if the set names one
 }
 
 // Requests to signers are signed with the coordinator key, over the method,
-// path, time and body. A signer accepts them for requestSkew either side of
-// its clock; a replay in that window is harmless, as signing is idempotent.
+// path, time, a fresh nonce, the public key of the signer it is for, and the
+// body. A signer accepts a request only if it names this signer, only once,
+// and for requestSkew either side of its clock.
 const requestSkew = 5 * time.Minute
 
-func requestDigest(method, path string, unix int64, body []byte) []byte {
+func requestDigest(method, path string, unix int64, nonce, signer string, body []byte) []byte {
 	bodySum := sha256.Sum256(body)
-	msg := fmt.Sprintf("btcvm coordinator request v1\n%s\n%s\n%d\n%x", method, path, unix, bodySum)
+	msg := fmt.Sprintf("btcvm coordinator request v2\n%s\n%s\n%d\n%s\n%s\n%x", method, path, unix, nonce, signer, bodySum)
 	sum := sha256.Sum256([]byte(msg))
 	return sum[:]
+}
+
+// newNonce is a request's nonce: 128 random bits, hex.
+func newNonce() string {
+	var n [16]byte
+	_, _ = rand.Read(n[:])
+	return hex.EncodeToString(n[:])
+}
+
+// nonceCache holds the nonces of requests a signer has accepted, until they
+// are too old to be accepted anyway.
+type nonceCache struct {
+	mu   sync.Mutex
+	seen map[string]int64 // nonce -> unix time it can be forgotten
+}
+
+// maxNonces bounds the cache: a coordinator makes a few requests a minute.
+const maxNonces = 100_000
+
+// fresh records nonce and reports whether it is new.
+func (n *nonceCache) fresh(nonce string, now time.Time) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.seen == nil {
+		n.seen = map[string]int64{}
+	}
+	if _, ok := n.seen[nonce]; ok {
+		return false
+	}
+	if len(n.seen) >= maxNonces {
+		for k, until := range n.seen {
+			if until < now.Unix() {
+				delete(n.seen, k)
+			}
+		}
+		if len(n.seen) >= maxNonces {
+			return false
+		}
+	}
+	n.seen[nonce] = now.Add(2 * requestSkew).Unix()
+	return true
 }
 
 // signerClient is shared by every remote signer; http.Client is safe for
@@ -245,6 +291,40 @@ func readCosigners(path string) ([]*remoteSigner, error) {
 	return list, nil
 }
 
+// identifyCosigners fills in each remote signer's public key from the set's
+// card with its URL, where cosigners.json doesn't give it, and checks every
+// key is one of the set's or of a set it replaced.
+func (s *signerSet) identifyCosigners(list []*remoteSigner) error {
+	for _, r := range list {
+		if r.PublicKey == "" {
+			for _, op := range s.Operators {
+				if strings.TrimRight(op.URL, "/") == r.URL {
+					r.PublicKey = op.PublicKey
+				}
+			}
+		}
+		if r.PublicKey == "" {
+			if s.coordKey == nil {
+				continue // requests aren't signed, so name no signer
+			}
+			return fmt.Errorf("no public key for the signer at %s: add its \"publicKey\" (from its card.json)", r.URL)
+		}
+		raw, err := hex.DecodeString(r.PublicKey)
+		if err != nil {
+			return fmt.Errorf("signer %s: %w", r.URL, err)
+		}
+		pub, err := btcec.ParsePubKey(raw)
+		if err != nil {
+			return fmt.Errorf("signer %s: %w", r.URL, err)
+		}
+		if s.indexOf(pub) < 0 && s.retired(pub) == nil {
+			return fmt.Errorf("signer %s: its key is not in the signer set", r.URL)
+		}
+		r.PublicKey = hex.EncodeToString(pub.SerializeCompressed())
+	}
+	return nil
+}
+
 func (r *remoteSigner) post(path string, body, result any) error {
 	raw, _ := json.Marshal(body)
 	return r.do(http.MethodPost, path, raw, result)
@@ -262,9 +342,13 @@ func (r *remoteSigner) do(method, path string, body []byte, result any) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if r.auth != nil {
-		now := time.Now().Unix()
-		sig := ecdsa.Sign(r.auth, requestDigest(method, path, now, body))
+		if r.PublicKey == "" {
+			return fmt.Errorf("the coordinator doesn't know %s's public key", r.URL)
+		}
+		now, nonce := time.Now().Unix(), newNonce()
+		sig := ecdsa.Sign(r.auth, requestDigest(method, path, now, nonce, r.PublicKey, body))
 		req.Header.Set("X-Btcvm-Time", strconv.FormatInt(now, 10))
+		req.Header.Set("X-Btcvm-Nonce", nonce)
 		req.Header.Set("X-Btcvm-Signature", hex.EncodeToString(sig.Serialize()))
 	}
 	if r.Token != "" {
@@ -448,6 +532,8 @@ type cosigner struct {
 	// open accepts unauthenticated requests: only on loopback, where the
 	// coordinator runs on the same machine.
 	open bool
+	// nonces are the requests accepted recently, so none is accepted twice.
+	nonces nonceCache
 	// feeTolerance is how far above this signer's own fee estimate, in
 	// percent of it, a Bitcoin transaction's fee rate may be (0: 200).
 	// feeRateCap is the most it signs for in sat/vB, whatever the estimate
@@ -490,13 +576,21 @@ func (c *cosigner) authenticate(r *http.Request) ([]byte, error) {
 		if d := time.Since(time.Unix(unix, 0)); d > requestSkew || d < -requestSkew {
 			return nil, errors.New("unauthorized: request time is too far from this signer's clock")
 		}
+		nonce := r.Header.Get("X-Btcvm-Nonce")
+		if raw, err := hex.DecodeString(nonce); err != nil || len(raw) != 16 {
+			return nil, errors.New("unauthorized: the request has no nonce")
+		}
 		raw, err := hex.DecodeString(r.Header.Get("X-Btcvm-Signature"))
 		if err != nil {
 			return nil, errors.New("unauthorized: not signed by the coordinator")
 		}
+		me := hex.EncodeToString(c.key.PubKey().SerializeCompressed())
 		sig, err := ecdsa.ParseDERSignature(raw)
-		if err != nil || !sig.Verify(requestDigest(r.Method, r.URL.Path, unix, body), coord) {
-			return nil, errors.New("unauthorized: not signed by the coordinator")
+		if err != nil || !sig.Verify(requestDigest(r.Method, r.URL.Path, unix, nonce, me, body), coord) {
+			return nil, errors.New("unauthorized: not signed by the coordinator for this signer")
+		}
+		if !c.nonces.fresh(nonce, time.Now()) {
+			return nil, errors.New("unauthorized: a replayed request")
 		}
 	}
 	if c.token == "" && c.b.signers.coordKey == nil && !c.open {
