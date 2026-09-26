@@ -310,7 +310,7 @@ func TestRotationCeremony(t *testing.T) {
 		installed, err := readSignerSet(filepath.Join(dir, setFileName))
 		require.NoError(err)
 		require.Equal(next.fingerprint(), installed.fingerprint(), "the retired signer runs with the new set")
-		kept, err := readSignerSet(filepath.Join(dir, "signers."+old.fingerprint()+".json"))
+		kept, err := readSignerSet(filepath.Join(dir, "signers."+old.fingerprintHex()+".json"))
 		require.NoError(err, "and keeps the set it ran with")
 		require.Equal(old.fingerprint(), kept.fingerprint())
 		unit, err := os.ReadFile(filepath.Join(dir, unitFileName))

@@ -676,8 +676,8 @@ func setupJoin(args []string) error {
 
 	switch {
 	case *fingerprint != "":
-		if *fingerprint != set.fingerprint() {
-			return fmt.Errorf("the set's fingerprint is %s, not %s: do not join", set.fingerprint(), *fingerprint)
+		if err := set.checkFingerprint(*fingerprint); err != nil {
+			return err
 		}
 	case p.interactive:
 		fmt.Fprintln(p.out, "Confirm this fingerprint with the coordinator and the other signers over a")
@@ -706,7 +706,7 @@ func setupJoin(args []string) error {
 	installed := filepath.Join(*dir, setFileName)
 	// A rotation replaces the set this signer ran with: keep a copy.
 	if old, err := readSignerSet(installed); err == nil && old.fingerprint() != set.fingerprint() {
-		kept := filepath.Join(*dir, "signers."+old.fingerprint()+".json")
+		kept := filepath.Join(*dir, "signers."+old.fingerprintHex()+".json")
 		if err := writeNew(kept, mustJSON(old.publicCopy()), 0o644); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}

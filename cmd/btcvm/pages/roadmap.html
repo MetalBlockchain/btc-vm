@@ -104,7 +104,7 @@
     <tbody>
       <tr><td><code>init</code></td><td>Each operator</td><td>Makes a key on their own machine, or imports one at a hidden prompt, and produces a public signer card signed with that key.</td></tr>
       <tr><td><code>coordinator</code></td><td>Bridge operator</td><td>Makes the key that signs every request to the signers.</td></tr>
-      <tr><td><code>assemble</code></td><td>Bridge operator</td><td>Checks the cards and builds the signer set: the keys, how many must sign, the networks, the fees and caps. Prints a short fingerprint.</td></tr>
+      <tr><td><code>assemble</code></td><td>Bridge operator</td><td>Checks the cards and builds the signer set: the keys, how many must sign, the networks, the fees and caps. Prints its fingerprint: the whole hash of the set, as 24 words.</td></tr>
       <tr><td><code>join</code></td><td>Each operator</td><td>Shows the set; operators confirm the fingerprint with each other on a call; writes a ready-to-install service.</td></tr>
       <tr><td><code>check</code></td><td>Anyone</td><td>Checks the key, both nodes, sync, and that the service refuses unsigned requests.</td></tr>
     </tbody>

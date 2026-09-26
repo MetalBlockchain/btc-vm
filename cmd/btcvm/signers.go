@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/MetalBlockchain/btcvm/btcd/btcec/v2"
 	"github.com/MetalBlockchain/btcvm/btcd/btcec/v2/ecdsa"
@@ -99,25 +98,6 @@ type pegPolicy struct {
 	ConfirmationTiers []confirmationTier `json:"confirmationTiers,omitempty"`
 }
 
-// fingerprint identifies everything the signers agree to. Each signer reads
-// it out to the others over a separate channel before joining.
-func (s *signerSet) fingerprint() string {
-	agreed, _ := json.Marshal(struct {
-		Required       int            `json:"required"`
-		PublicKeys     []string       `json:"publicKeys"`
-		Networks       *setNetworks   `json:"networks"`
-		Operators      []operatorCard `json:"operators"`
-		CoordinatorKey string         `json:"coordinatorKey"`
-		Policy         *pegPolicy     `json:"policy"`
-		// Omitted when empty, so sets made before rotation, or before
-		// transport keys, keep their fingerprint.
-		Previous       []priorSet `json:"previous,omitempty"`
-		CoordinatorTLS string     `json:"coordinatorTLS,omitempty"`
-	}{s.Required, s.PublicKeys, s.Networks, s.Operators, s.CoordinatorKey, s.Policy, s.Previous, s.CoordinatorTLS})
-	sum := sha256.Sum256(agreed)
-	h := hex.EncodeToString(sum[:10])
-	return strings.Join([]string{h[0:4], h[4:8], h[8:12], h[12:16], h[16:20]}, "-")
-}
 
 // refuseKeys fails if the set holds private keys, for processes that
 // never sign: the web server and the monitor face the internet or run

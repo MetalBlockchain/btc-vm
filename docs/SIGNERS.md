@@ -99,11 +99,18 @@ For an agent or script, the same steps take flags. For example:
 btcvm signer-setup init -yes -dir /var/lib/btcvm-signer -name "Example Pool" \
   -url https://signer.example.com:9700            # makes a new key
 btcvm signer-setup join -yes -dir /var/lib/btcvm-signer -signers signers.json \
-  -fingerprint 3f9a-02bc-7d41-e0a8-55c1 -max-daily 0.5
+  -fingerprint "$FINGERPRINT" -max-daily 0.5    # the 24 words the operators confirmed
 ```
 
 Without a terminal, `join` needs `-fingerprint`, and it must be the one the
 other signers read out. An agent can't confirm a fingerprint for itself.
+
+A fingerprint is the whole SHA-256 of the set, spelled as 24 words
+(`join` also takes its 64 hex characters). The words come from the BIP39
+list, but a fingerprint is not a seed phrase and holds nothing secret: read
+all 24 out. Sets made before showed only the first 80 bits, as
+`xxxx-xxxx-xxxx-xxxx-xxxx`; the set's hash is the same, and `join` refuses
+that short form.
 
 ### What each operator runs
 
