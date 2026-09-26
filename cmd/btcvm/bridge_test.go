@@ -572,8 +572,9 @@ func TestRefundHeldDeposit(t *testing.T) {
 	alice, aliceOnBTC := h.user(1), h.user(2)
 
 	// Two deposits so the peg has a confirmed output to pay from, one of
-	// them over the cap.
-	h.deposit(50*btc, &alice, 6)
+	// them over the cap. The first is a block older, so it is the peg's
+	// anchor, which the refund spends first.
+	h.deposit(50*btc, &alice, 7)
 	require.NotEmpty(h.step())
 	h.vm.mine()
 	over := h.deposit(150*btc, &alice, 6)
@@ -584,7 +585,10 @@ func TestRefundHeldDeposit(t *testing.T) {
 	_, err := h.b.refund(op, aliceOnBTC, false)
 	require.NoError(err)
 	refundTx := h.btc.txs[len(h.btc.txs)-1].tx
-	require.Equal(150*btc-h.feeOf(refundTx)-h.toPeg(refundTx), paidTo(h.btc, aliceOnBTC), "150 BTC less the network fee, and the change the peg keeps")
+	// It spends the 50 BTC anchor and the 150 BTC deposit: 150 BTC less the
+	// network fee, and 50 BTC change back to the peg.
+	require.Equal(150*btc-h.feeOf(refundTx), paidTo(h.btc, aliceOnBTC))
+	require.Equal(int64(50*btc), h.toPeg(refundTx))
 	refunded, ok := parseRefund(refundTx)
 	require.True(ok)
 	require.Equal(op, refunded)
@@ -595,7 +599,7 @@ func TestRefundHeldDeposit(t *testing.T) {
 	require.Zero(a.UnclaimedOnBTC)
 	require.True(a.solvent(), "%+v", a)
 	require.Equal(int64(50*btc), a.Circulating)
-	require.Equal(int64(50*btc+pegDust), a.Locked, "the refund's change stays in the peg")
+	require.Equal(int64(50*btc), a.Locked, "the refund's change stays in the peg")
 	_, err = h.b.refund(op, aliceOnBTC, false)
 	require.ErrorContains(err, "already refunded")
 

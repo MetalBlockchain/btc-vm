@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -231,6 +232,8 @@ func TestSignerRefusesNeedlessInputs(t *testing.T) {
 		}
 	}
 	require.Len(confirmed, 3)
+	// The anchor goes first, as every payout's first input must be.
+	sort.SliceStable(confirmed, func(i, j int) bool { return confirmed[i].outPoint == s.pegAnchor.outPoint })
 	_, _, _, err = h.signers[0].check(build(confirmed))
 	require.ErrorContains(err, "does not need")
 
@@ -381,7 +384,10 @@ func TestEveryPayoutPaysThePeg(t *testing.T) {
 	h := newHarness(t)
 	h.b.maxDeposit = 50 * btc
 	alice := h.user(1)
-	held := h.deposit(60*btc, &alice, 6) // over the cap: held
+	// Over the cap: held. One block older than the other deposit, so it is
+	// the peg's anchor, the coin a refund must spend first, and it covers
+	// the refund exactly, leaving no change.
+	held := h.deposit(60*btc, &alice, 7)
 	h.deposit(10*btc, &alice, 6)
 	require.NotEmpty(h.step())
 	h.vm.mine()

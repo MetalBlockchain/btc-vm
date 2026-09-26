@@ -38,11 +38,17 @@ Each signer runs `btcvm signer` with one key. For every proposal it:
    only if the proposal matches byte for byte. The coordinator cannot change
    an amount, a destination or the fee: a payout's fee rate must be within
    the policy's range.
-4. **Checks its signing log.** A second transaction for an action it has
+4. **Checks it spends the oldest coin first.** Every payout and refund must
+   spend the peg's oldest confirmed coin as its first input, and every
+   release the reserve's oldest coin, as this signer's own node sees them.
+   So any two transactions any signers sign on one chain conflict, and at
+   most one confirms, even if the coordinator and one other signer collude
+   to get the same withdrawal signed twice by different honest signers.
+5. **Checks its signing log.** A second transaction for an action it has
    already signed must spend one of the same outputs as each earlier one that
    could still confirm. At most one can then confirm, so a deposit can't be
    credited twice through this signer.
-5. **Applies its daily limit**, if one is set (`-max-daily`).
+6. **Applies its daily limit**, if one is set (`-max-daily`).
 
 A compromised coordinator can therefore delay transfers but can't move
 locked BTC. That would take `Required` signers.

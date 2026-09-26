@@ -91,12 +91,19 @@ type pegState struct {
 	reserveCreated int64                  // reserve paid in by consensus (coinbases)
 	reserveUnspent int64                  // reserve still held
 	reserveUTXOs   []utxo
-	vmPending      bool                             // a release is still in the VM mempool
-	released       map[wire.OutPoint]chainhash.Hash // deposit -> release txid
-	pegOuts        []pegOut
-	deposits       []deposit
-	paid           map[chainhash.Hash]chainhash.Hash // peg-out -> payment txid
-	refunded       map[wire.OutPoint]chainhash.Hash  // deposit -> refund txid
+	// reserveAnchor and pegAnchor are the oldest confirmed coins of the
+	// reserve and the peg, whether or not a transaction in a mempool spends
+	// them. Every release spends reserveAnchor, and every payout and refund
+	// spends pegAnchor, so any two transactions the signers sign on one chain
+	// conflict and at most one confirms (see oldestCoin).
+	reserveAnchor *utxo
+	pegAnchor     *utxo
+	vmPending     bool                             // a release is still in the VM mempool
+	released      map[wire.OutPoint]chainhash.Hash // deposit -> release txid
+	pegOuts       []pegOut
+	deposits      []deposit
+	paid          map[chainhash.Hash]chainhash.Hash // peg-out -> payment txid
+	refunded      map[wire.OutPoint]chainhash.Hash  // deposit -> refund txid
 	// unconfirmed are Bitcoin payments and refunds not yet in a block, by
 	// txid: they can still be replaced by one paying a higher fee.
 	unconfirmed map[chainhash.Hash]chainTx
@@ -272,6 +279,13 @@ func (b *bridge) load() (*pegState, error) {
 			spentByKnown[in.PreviousOutPoint] = true
 		}
 	}
+	var reserveCoins []utxo
+	for _, u := range held {
+		if u.confirmations > 0 {
+			reserveCoins = append(reserveCoins, u)
+		}
+	}
+	s.reserveAnchor = oldestCoin(reserveCoins)
 	for _, u := range held {
 		if spentByKnown[u.outPoint] {
 			continue
@@ -391,12 +405,15 @@ func (b *bridge) load() (*pegState, error) {
 		}
 	}
 	confirmedOut := map[wire.OutPoint]int64{}
+	confirmedCoin := map[wire.OutPoint]utxo{}
 	for _, t := range btcTxs {
 		if t.confirmations > 0 {
 			hash := t.tx.TxHash()
 			for i, out := range t.tx.TxOut {
 				if s.redeemFor[string(out.PkScript)] != nil {
-					confirmedOut[wire.OutPoint{Hash: hash, Index: uint32(i)}] = out.Value
+					op := wire.OutPoint{Hash: hash, Index: uint32(i)}
+					confirmedOut[op] = out.Value
+					confirmedCoin[op] = utxo{outPoint: op, value: out.Value, pkScript: out.PkScript, confirmations: t.confirmations}
 				}
 			}
 		}
@@ -410,6 +427,20 @@ func (b *bridge) load() (*pegState, error) {
 			}
 		}
 	}
+	// The anchor is chosen from what is in blocks alone: the wallet stops
+	// listing an output a mempool transaction spends, so those are added
+	// back, and a transaction someone shows this node without mining it
+	// can't move the anchor.
+	var pegCoins []utxo
+	for _, u := range s.lockedUTXOs {
+		if u.confirmations > 0 {
+			pegCoins = append(pegCoins, u)
+		}
+	}
+	for op := range pendingSpent {
+		pegCoins = append(pegCoins, confirmedCoin[op])
+	}
+	s.pegAnchor = oldestCoin(pegCoins)
 
 	// Oldest first, so the bridge works through them in order.
 	sort.Slice(s.deposits, func(i, j int) bool {
@@ -515,6 +546,106 @@ func (b *bridge) logWaiting(failed error) {
 	}
 }
 
+// payoutInputs is what a payout or refund of value spends: the peg's
+// anchor, and if it doesn't cover the payout, what selectForPayout picks
+// from the other confirmed coins. While a transaction in the mempool spends
+// the anchor, nothing else can be paid: it would conflict.
+func (s *pegState) payoutInputs(confirmed []utxo, value int64) ([]utxo, error) {
+	if s.pegAnchor == nil {
+		return nil, errors.New("the peg holds no confirmed BTC")
+	}
+	if !containsOutPoint(confirmed, s.pegAnchor.outPoint) {
+		return nil, fmt.Errorf("waiting for the payment spending %v to confirm", s.pegAnchor.outPoint)
+	}
+	return anchoredSelection(*s.pegAnchor, confirmed, value, func(rest []utxo, need int64) ([]utxo, error) {
+		return selectForPayout(rest, need)
+	})
+}
+
+// releaseInputs is what a release of value spends: the reserve's anchor,
+// and more of the reserve if it doesn't cover the release.
+func (s *pegState) releaseInputs(value int64) ([]utxo, int64, error) {
+	if s.reserveAnchor == nil || !containsOutPoint(s.reserveUTXOs, s.reserveAnchor.outPoint) {
+		return nil, 0, errors.New("waiting for the reserve's oldest coin to be free")
+	}
+	inputs, err := anchoredSelection(*s.reserveAnchor, s.reserveUTXOs, value, func(rest []utxo, need int64) ([]utxo, error) {
+		picked, _, err := selectUTXOs(rest, need)
+		return picked, err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	var total int64
+	for _, u := range inputs {
+		total += u.value
+	}
+	return inputs, total, nil
+}
+
+func containsOutPoint(coins []utxo, op wire.OutPoint) bool {
+	for _, u := range coins {
+		if u.outPoint == op {
+			return true
+		}
+	}
+	return false
+}
+
+// oldestCoin returns the coin in the oldest block, ties broken by outpoint,
+// or nil. It is the anchor every signed transaction on a chain must spend
+// first.
+//
+// Why: each signer's log stops it signing two transactions for one action
+// that could both confirm, but that is per signer. With 2 of 3, a dishonest
+// coordinator and one dishonest signer B could have A and B sign a payout
+// from some coins and B and C sign the same payout again from other coins;
+// neither honest signer signs twice, and both payouts confirm. If every
+// transaction must spend the oldest coin, any two of them conflict. The
+// oldest coin can't change until a transaction spending it is in a block,
+// since new coins are always newer, so a withheld transaction can't be
+// dodged by waiting for new deposits.
+func oldestCoin(coins []utxo) *utxo {
+	var best *utxo
+	for i := range coins {
+		u := &coins[i]
+		if best == nil || u.confirmations > best.confirmations ||
+			u.confirmations == best.confirmations && outPointLess(u.outPoint, best.outPoint) {
+			best = u
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	c := *best
+	return &c
+}
+
+func outPointLess(a, b wire.OutPoint) bool {
+	if c := bytes.Compare(a.Hash[:], b.Hash[:]); c != 0 {
+		return c < 0
+	}
+	return a.Index < b.Index
+}
+
+// anchoredSelection is the inputs a signed transaction spends: the anchor
+// first, then, if it doesn't cover need, what select picks from the rest.
+func anchoredSelection(anchor utxo, available []utxo, need int64, pick func([]utxo, int64) ([]utxo, error)) ([]utxo, error) {
+	if anchor.value >= need {
+		return []utxo{anchor}, nil
+	}
+	var rest []utxo
+	for _, u := range available {
+		if u.outPoint != anchor.outPoint {
+			rest = append(rest, u)
+		}
+	}
+	more, err := pick(rest, need-anchor.value)
+	if err != nil {
+		return nil, err
+	}
+	return append([]utxo{anchor}, more...), nil
+}
+
 // selectForPayout picks the peg outputs a payout spends: the smallest one
 // that covers value, so a payout that stalls ties up as little of the peg as
 // it can; or, if none does alone, the fewest, largest first.
@@ -563,7 +694,7 @@ func selectUTXOs(utxos []utxo, amount int64) ([]utxo, int64, error) {
 // release credits d on BTCVM from the reserve. The reserve gives up the
 // full deposit; the VM fee comes out of the credit.
 func (b *bridge) release(s *pegState, d deposit) (chainhash.Hash, error) {
-	inputs, total, err := selectUTXOs(s.reserveUTXOs, d.value)
+	inputs, total, err := s.releaseInputs(d.value)
 	if err != nil {
 		return chainhash.Hash{}, err
 	}
@@ -653,7 +784,7 @@ func (b *bridge) payFromPeg(s *pegState, value int64, dest destination, data []b
 			confirmed = append(confirmed, u)
 		}
 	}
-	inputs, err := selectForPayout(confirmed, value)
+	inputs, err := s.payoutInputs(confirmed, value)
 	if err != nil {
 		return chainhash.Hash{}, 0, err
 	}
@@ -726,7 +857,8 @@ func (b *bridge) buildPayout(inputs []utxo, prev []spent, value int64, dest dest
 	}
 	// Every input must be needed: each one adds to the fee, which comes
 	// out of the payout, so extra inputs would spend the user's BTC on fees.
-	for i := range prev {
+	// The first is the anchor (oldestCoin), which every payout spends.
+	for i := 1; i < len(prev); i++ {
 		if total-prev[i].value >= value {
 			return nil, fmt.Errorf("spends %v, which the payout does not need", inputs[i].outPoint)
 		}

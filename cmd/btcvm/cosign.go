@@ -408,6 +408,19 @@ func (b *bridge) paymentBlocks(d destination) map[string]string {
 	return blocks
 }
 
+// spendsAnchor checks that tx spends the chain's anchor, as this signer
+// sees it, as its first input (see oldestCoin), so it conflicts with any
+// other transaction the signers have signed on that chain.
+func spendsAnchor(tx *wire.MsgTx, anchor *utxo) error {
+	if anchor == nil {
+		return errors.New("this signer sees no confirmed coin to anchor the transaction")
+	}
+	if len(tx.TxIn) == 0 || tx.TxIn[0].PreviousOutPoint != anchor.outPoint {
+		return fmt.Errorf("the transaction must spend %v, the oldest confirmed coin, first", anchor.outPoint)
+	}
+	return nil
+}
+
 // --- signer --------------------------------------------------------------------
 
 // cosigner is the "btcvm signer" service: one key, its own view of both
@@ -675,6 +688,9 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 		if b.maxCirculating > 0 && s.reserveCreated-s.reserveUnspent+d.value > b.maxCirculating {
 			return nil, nil, 0, fmt.Errorf("crediting deposit %v would exceed the circulating cap", op)
 		}
+		if err := spendsAnchor(tx, s.reserveAnchor); err != nil {
+			return nil, nil, 0, err
+		}
 		inputs, total, err := pick(s.reserveUTXOs)
 		if err != nil {
 			return nil, nil, 0, err
@@ -772,6 +788,9 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 				if u.confirmations > 0 {
 					confirmed = append(confirmed, u)
 				}
+			}
+			if err := spendsAnchor(tx, s.pegAnchor); err != nil {
+				return nil, nil, 0, err
 			}
 			if inputs, _, err = pick(confirmed); err != nil {
 				return nil, nil, 0, err

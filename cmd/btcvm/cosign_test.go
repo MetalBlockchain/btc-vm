@@ -197,8 +197,11 @@ func TestSignerRefusesBadProposals(t *testing.T) {
 			tx.TxIn[0].SignatureScript = []byte{1}
 		}), "unsigned"},
 		"spends a non-reserve output": {tamper(func(tx *wire.MsgTx) {
-			tx.TxIn[0].PreviousOutPoint = *h.coin()
+			tx.AddTxIn(wire.NewTxIn(h.coin(), nil, nil))
 		}), "not a confirmed peg output"},
+		"doesn't spend the anchor first": {tamper(func(tx *wire.MsgTx) {
+			tx.TxIn[0].PreviousOutPoint = *h.coin()
+		}), "the oldest confirmed coin"},
 		"unknown deposit": {func() signRequest {
 			r := good
 			r.Action.Deposit = wire.OutPoint{Hash: chainhash.Hash{7}}.String()
@@ -242,6 +245,12 @@ func TestSignerWontDoubleSign(t *testing.T) {
 	h.deposit(100*btc, &alice, 6)
 	reserve := h.reserveUTXOs()
 	require.Len(reserve, 2)
+	// The anchor (the oldest coin) first, as every release must spend it.
+	loaded, err := h.b.load()
+	require.NoError(err)
+	if reserve[0].outPoint != loaded.reserveAnchor.outPoint {
+		reserve[0], reserve[1] = reserve[1], reserve[0]
+	}
 	first, _ := h.releaseRequest(reserve[:1])
 	second, _ := h.releaseRequest(reserve[1:])
 	r := h.b.cosigners[0]
@@ -250,13 +259,15 @@ func TestSignerWontDoubleSign(t *testing.T) {
 		return r.post("/v1/sign", req, &signResponse{})
 	}
 	require.NoError(sign(first))
-	// Could confirm alongside the first: refused.
-	require.ErrorContains(sign(second), "could confirm alongside")
+	// Could confirm alongside the first: refused. Every release must spend
+	// the reserve's oldest coin first, so a release from other coins is
+	// refused before the signing log is even consulted.
+	require.ErrorContains(sign(second), "the oldest confirmed coin")
 	// A different textual encoding of the same deposit is the same action.
 	// The deposit output is vout 0, so appending a zero changes :0 to :00.
 	aliased := second
 	aliased.Action.Deposit += "0"
-	require.ErrorContains(sign(aliased), "could confirm alongside")
+	require.ErrorContains(sign(aliased), "the oldest confirmed coin")
 	// The same transaction again is fine.
 	require.NoError(sign(first))
 
@@ -266,7 +277,9 @@ func TestSignerWontDoubleSign(t *testing.T) {
 	spend.AddTxIn(wire.NewTxIn(&reserve[0].outPoint, nil, nil))
 	spend.AddTxOut(wire.NewTxOut(reserve[0].value, h.b.signers.pkScript()))
 	h.vm.add(spend, 1)
-	second, _ = h.releaseRequest(reserve[1:])
+	loaded, err = h.b.load()
+	require.NoError(err)
+	second, _ = h.releaseRequest([]utxo{*loaded.reserveAnchor})
 	require.NoError(sign(second))
 
 	// The log survives a restart.
@@ -329,4 +342,71 @@ func TestSignerAuthAndDailyLimit(t *testing.T) {
 	require.NoError(h.b.cosigners[0].status(&status))
 	require.Equal(hex.EncodeToString(h.signers[0].key.PubKey().SerializeCompressed()), status["publicKey"])
 	require.Equal("100.00000000", status["signedToday"])
+}
+
+// TestColludingSignerCantDoublePay: the attack the anchor stops. A
+// dishonest coordinator and one dishonest signer (B) have A and B sign a
+// payout and keep it back, then ask C to sign the same payout again from a
+// different coin, perhaps after a new deposit makes another coin the natural
+// choice, or after showing C's node a decoy transaction spending the first
+// coin. Neither honest signer would sign twice, so without the anchor both
+// payouts could confirm. C must refuse anything that doesn't spend the
+// oldest confirmed coin, which the kept-back payout already spends.
+func TestColludingSignerCantDoublePay(t *testing.T) {
+	require := require.New(t)
+	h := newCosignHarness(t)
+	for _, c := range h.signers {
+		c.b.minFeeRate, c.b.maxFeeRate = 1, 50
+	}
+	alice := h.user(1)
+	h.deposit(10*btc, &alice, 9) // the oldest: the peg's anchor
+	h.deposit(10*btc, &alice, 8)
+	for h.step() != "" {
+		h.vm.mine()
+	}
+	req := h.pegOut(5*btc, h.user(2))
+
+	s, err := h.b.load()
+	require.NoError(err)
+	p, ok := findPegOut(s.pegOuts, req.TxHash())
+	require.True(ok)
+	require.NotNil(s.pegAnchor)
+	var other utxo
+	for _, u := range s.lockedUTXOs {
+		if u.confirmations > 0 && u.outPoint != s.pegAnchor.outPoint && u.value >= p.value {
+			other = u
+		}
+	}
+	require.NotZero(other.value)
+	build := func(inputs []utxo) signRequest {
+		prev, _, err := s.pegSpends(inputs)
+		require.NoError(err)
+		tx, err := h.b.buildPayout(inputs, prev, p.value, p.dest, encodePayment(p.txid), 10)
+		require.NoError(err)
+		return signRequest{Chain: chainBitcoin, Action: action{Kind: actionPayout, PegOut: p.txid.String()}, Tx: encodeTx(tx), FeeRate: 10}
+	}
+	sign := func(i int, r signRequest) error {
+		return h.b.cosigners[i].post("/v1/sign", r, &signResponse{})
+	}
+
+	// A and B sign the payout from the anchor; it is kept back.
+	kept := build([]utxo{*s.pegAnchor})
+	require.NoError(sign(0, kept))
+	require.NoError(sign(1, kept))
+
+	// C is asked for the same payout from another coin: refused.
+	require.ErrorContains(sign(2, build([]utxo{other})), "the oldest confirmed coin")
+
+	// A new deposit arrives. The anchor is still the oldest coin, so C
+	// still refuses.
+	h.deposit(20*btc, &alice, 1)
+	require.ErrorContains(sign(2, build([]utxo{other})), "the oldest confirmed coin")
+
+	// C's node is shown a decoy spending the anchor, never mined. The
+	// anchor comes from blocks alone, so C still refuses.
+	decoy := wire.NewMsgTx(2)
+	decoy.AddTxIn(wire.NewTxIn(&s.pegAnchor.outPoint, nil, nil))
+	decoy.AddTxOut(wire.NewTxOut(s.pegAnchor.value-1000, h.b.signers.pkScript()))
+	h.btc.add(decoy, 0)
+	require.ErrorContains(sign(2, build([]utxo{other})), "the oldest confirmed coin")
 }
