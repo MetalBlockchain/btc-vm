@@ -98,7 +98,6 @@ type pegPolicy struct {
 	ConfirmationTiers []confirmationTier `json:"confirmationTiers,omitempty"`
 }
 
-
 // refuseKeys fails if the set holds private keys, for processes that
 // never sign: the web server and the monitor face the internet or run
 // unattended, and holding keys there would put the peg behind them.

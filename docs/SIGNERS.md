@@ -156,6 +156,11 @@ that short form.
   chains show the key has signed). `btcvm signer-log check` lists what a
   log lacks without changing anything; run it before upgrading a signer.
 
+Each new deposit address a signer is told about, by `register` or in a
+proposal, is one more address its node watches for good, so a signer
+starts watching at most `-max-registrations` new ones an hour (600 by
+default); the coordinator retries the rest later.
+
 A payout's or refund's fee rate is chosen by the coordinator and comes out
 of the payout, so the policy's range isn't enough: each signer also refuses
 a rate above twice its own Bitcoin node's estimate (`-fee-tolerance`, in
