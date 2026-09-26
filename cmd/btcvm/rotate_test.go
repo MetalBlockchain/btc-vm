@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/MetalBlockchain/btcvm/btcd/chaincfg/chainhash"
 	"github.com/MetalBlockchain/btcvm/btcd/wire"
 )
 
@@ -342,4 +345,83 @@ func TestRetiredSignerRestarts(t *testing.T) {
 		}
 	}
 	require.Positive(signed, "the moves are in the logs")
+}
+
+// TestMovesSpendTheAnchorAndAreLoggedByTheirCoins: every move of a retired
+// set's coins spends its oldest coin first, so any two conflict; and a move
+// is logged by the coins it spends, not by the label the coordinator gives
+// it, so relabelling a move can't hide it from the log.
+func TestMovesSpendTheAnchorAndAreLoggedByTheirCoins(t *testing.T) {
+	require := require.New(t)
+	h := newCosignHarness(t)
+	for _, c := range h.signers {
+		c.b.minFeeRate, c.b.maxFeeRate = 1, 50
+	}
+	h.b.minFeeRate, h.b.maxFeeRate = 1, 50
+	alice := h.user(1)
+	_, err := registerDeposit(h.b, alice)
+	require.NoError(err)
+	h.personalDeposit(10*btc, alice, 6)
+	h.deposit(1*btc, nil, 6)
+	for h.step() != "" {
+		h.vm.mine()
+	}
+	r := h.rotate(t)
+	s, err := h.b.load()
+	require.NoError(err)
+	sets, by := h.b.legacyBySet(s, s.legacyUTXOs)
+	require.Len(sets, 1)
+	coins := by[sets[0]]
+	require.GreaterOrEqual(len(coins), 2)
+	require.Equal(s.legacyPegAnchor[sets[0]].outPoint, coins[0].outPoint, "the coordinator moves the oldest coin first")
+	build := func(coins []utxo, rate int64, label wire.OutPoint) (signRequest, *wire.MsgTx) {
+		prev, _, err := s.pegSpends(coins)
+		require.NoError(err)
+		successors := make([][]byte, len(coins))
+		for i, u := range coins {
+			successors[i] = h.b.successor(s, chainBitcoin, u)
+		}
+		tx, err := h.b.buildMigrate(chainBitcoin, sets[0], coins, prev, successors, rate)
+		require.NoError(err)
+		return signRequest{Chain: chainBitcoin, FeeRate: rate, Tx: encodeTx(tx),
+			Action: action{Kind: actionMigrate, Deposit: label.String()}}, tx
+	}
+	c := r.retired[0]
+
+	// A move that doesn't spend the anchor first, or at all: refused.
+	req, _ := build([]utxo{coins[1], coins[0]}, 5, coins[1].outPoint)
+	_, _, _, err = c.check(req)
+	require.ErrorContains(err, "the oldest confirmed coin, first")
+	req, _ = build(coins[1:], 5, coins[1].outPoint)
+	_, _, _, err = c.check(req)
+	require.ErrorContains(err, "the oldest confirmed coin, first")
+
+	// The honest move, signed under whatever label, is logged by its coins.
+	sign := func(req signRequest) error {
+		body, _ := json.Marshal(req)
+		_, err := c.handleSign(httptest.NewRequest("POST", "/v1/sign", bytes.NewReader(body)))
+		return err
+	}
+	req, tx := build(coins, 5, coins[0].outPoint)
+	require.NoError(sign(req))
+	relabelled, _ := build(coins, 6, wire.OutPoint{Hash: chainhash.Hash{0x99}})
+	require.NoError(sign(relabelled), "the same coins again, at a higher fee: a replacement")
+	var moves []string
+	for key := range c.log.Actions {
+		if strings.HasPrefix(key, actionMigrate+":") {
+			moves = append(moves, key)
+		}
+	}
+	require.Equal([]string{migrateKey(tx)}, moves, "one move, however it is labelled")
+	require.Len(c.log.Actions[migrateKey(tx)].Txs, 2)
+
+	// Logs written when a move's key was its first coin still load, and a
+	// key's coins are canonical whatever their order.
+	reversed := actionMigrate + ":" + coins[1].outPoint.String() + "+" + coins[0].outPoint.String()
+	key, err := normalMigrateKey(strings.TrimPrefix(reversed, actionMigrate+":"))
+	require.NoError(err)
+	require.Equal(migrateKey(tx), key)
+	old := &signingLog{Actions: map[string]*loggedAction{actionMigrate + ":" + coins[0].outPoint.Hash.String() + ":00": {}}}
+	require.NoError(old.normalizeKeys())
+	require.Contains(old.Actions, actionMigrate+":"+coins[0].outPoint.String())
 }

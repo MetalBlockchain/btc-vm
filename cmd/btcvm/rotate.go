@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/MetalBlockchain/btcvm/btcd/wire"
 )
@@ -37,6 +38,19 @@ var tagMigrate = []byte("BVMM")
 
 // maxMigrateInputs bounds one move, so it stays a standard transaction.
 const maxMigrateInputs = 100
+
+// migrateKey is a move's signing-log key: every coin it spends, sorted, read
+// from the transaction itself. The action's label is the coordinator's to
+// choose, so a key from it would let each move have a key of its own, and
+// the log would never compare two moves.
+func migrateKey(tx *wire.MsgTx) string {
+	ops := make([]string, len(tx.TxIn))
+	for i, in := range tx.TxIn {
+		ops[i] = in.PreviousOutPoint.String()
+	}
+	sort.Strings(ops)
+	return actionMigrate + ":" + strings.Join(ops, "+")
+}
 
 func encodeMigrate(to []byte) []byte {
 	sum := sha256.Sum256(to)
@@ -317,6 +331,16 @@ func (c *cosigner) checkMigrate(s *pegState, req signRequest, tx *wire.MsgTx, pi
 		if s.setFor[string(u.pkScript)] == set || b.setOfScript(u.pkScript) == set {
 			mine = append(mine, u)
 		}
+	}
+	// Every move of this set's coins on a chain spends its oldest one
+	// first, so any two moves conflict and at most one confirms, as with
+	// every other transaction the signers sign (oldestCoin).
+	anchor := s.legacyPegAnchor[set]
+	if req.Chain == chainBTCVM {
+		anchor = s.legacyReserveAnchor[set]
+	}
+	if err := spendsAnchor(tx, anchor); err != nil {
+		return nil, nil, nil, err
 	}
 	inputs, _, err := pick(mine)
 	if err != nil {

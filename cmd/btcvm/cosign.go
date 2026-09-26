@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,15 @@ func (a action) key() (string, error) {
 	default:
 		return "", fmt.Errorf("unknown action %q", a.Kind)
 	}
+}
+
+// logKey is the key a signed transaction is logged under: its action's, or
+// for a move, the coins it spends (migrateKey).
+func logKey(a action, tx *wire.MsgTx) (string, error) {
+	if a.Kind == actionMigrate {
+		return migrateKey(tx), nil
+	}
+	return a.key()
 }
 
 // proposal is a transaction the signers are asked to sign.
@@ -696,6 +706,9 @@ func (c *cosigner) handleSign(r *http.Request) (any, error) {
 		c.b.logf("refused %s: %v", key, err)
 		return nil, err
 	}
+	if key, err = logKey(req.Action, tx); err != nil {
+		return nil, err
+	}
 	sigs, err := signInputs(tx, prev, c.key)
 	if err != nil {
 		return nil, err
@@ -956,7 +969,7 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 	if encodeTx(want) != encodeTx(tx) {
 		return nil, nil, 0, errors.New("the proposal is not the transaction this signer would build for that action")
 	}
-	key, err := req.Action.key()
+	key, err := logKey(req.Action, tx)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -1171,14 +1184,22 @@ func (l *signingLog) normalizeKeys() error {
 		}
 		a := action{Kind: kind}
 		switch kind {
-		case actionRelease, actionRefund, actionMigrate:
+		case actionRelease, actionRefund:
 			a.Deposit = value
 		case actionPayout:
 			a.PegOut = value
+		case actionMigrate:
 		default:
 			return fmt.Errorf("invalid signing-log action key %q", rawKey)
 		}
-		key, err := a.key()
+		var key string
+		var err error
+		if kind == actionMigrate {
+			// A move's coins (older logs name only the first).
+			key, err = normalMigrateKey(value)
+		} else {
+			key, err = a.key()
+		}
 		if err != nil {
 			return fmt.Errorf("invalid signing-log action key %q: %w", rawKey, err)
 		}
@@ -1196,6 +1217,20 @@ func (l *signingLog) normalizeKeys() error {
 	}
 	l.Actions = normalized
 	return nil
+}
+
+// normalMigrateKey is the canonical form of a move's logged coins.
+func normalMigrateKey(value string) (string, error) {
+	var ops []string
+	for _, s := range strings.Split(value, "+") {
+		op, err := parseOutPoint(s)
+		if err != nil {
+			return "", err
+		}
+		ops = append(ops, op.String())
+	}
+	sort.Strings(ops)
+	return actionMigrate + ":" + strings.Join(ops, "+"), nil
 }
 
 func (l *signingLog) has(key string) bool { return l.Actions[key] != nil }

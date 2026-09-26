@@ -118,12 +118,16 @@ type pegState struct {
 	// conflict and at most one confirms (see oldestCoin).
 	reserveAnchor *utxo
 	pegAnchor     *utxo
-	vmPending     bool                             // a release is still in the VM mempool
-	released      map[wire.OutPoint]chainhash.Hash // deposit -> release txid
-	pegOuts       []pegOut
-	deposits      []deposit
-	paid          map[chainhash.Hash]chainhash.Hash // peg-out -> payment txid
-	refunded      map[wire.OutPoint]chainhash.Hash  // deposit -> refund txid
+	// legacyReserveAnchor and legacyPegAnchor are, for each set this one
+	// replaced, the oldest confirmed coin it still holds on each chain:
+	// every move of that set's coins spends it first (rotate.go).
+	legacyReserveAnchor, legacyPegAnchor map[*signerSet]*utxo
+	vmPending                            bool                             // a release is still in the VM mempool
+	released                             map[wire.OutPoint]chainhash.Hash // deposit -> release txid
+	pegOuts                              []pegOut
+	deposits                             []deposit
+	paid                                 map[chainhash.Hash]chainhash.Hash // peg-out -> payment txid
+	refunded                             map[wire.OutPoint]chainhash.Hash  // deposit -> refund txid
 	// unconfirmed are Bitcoin payments and refunds not yet in a block, by
 	// txid: they can still be replaced by one paying a higher fee.
 	unconfirmed map[chainhash.Hash]chainTx
@@ -342,6 +346,16 @@ func (b *bridge) load() (*pegState, error) {
 		}
 	}
 	s.reserveAnchor = oldestCoin(reserveCoins)
+	s.legacyReserveAnchor = map[*signerSet]*utxo{}
+	legacyReserve := map[*signerSet][]utxo{}
+	for _, u := range held {
+		if set := b.setOfScript(u.pkScript); u.confirmations > 0 && set != nil && set != b.signers {
+			legacyReserve[set] = append(legacyReserve[set], u)
+		}
+	}
+	for set, coins := range legacyReserve {
+		s.legacyReserveAnchor[set] = oldestCoin(coins)
+	}
 	for _, u := range held {
 		if spentByKnown[u.outPoint] {
 			continue
@@ -532,6 +546,20 @@ func (b *bridge) load() (*pegState, error) {
 		}
 	}
 	s.pegAnchor = oldestCoin(currentCoins)
+	s.legacyPegAnchor = map[*signerSet]*utxo{}
+	legacyPeg := map[*signerSet][]utxo{}
+	for _, u := range pegCoins {
+		set := s.setFor[string(u.pkScript)]
+		if set == nil {
+			set = b.setOfScript(u.pkScript)
+		}
+		if set != nil && set != b.signers {
+			legacyPeg[set] = append(legacyPeg[set], u)
+		}
+	}
+	for set, coins := range legacyPeg {
+		s.legacyPegAnchor[set] = oldestCoin(coins)
+	}
 	// A deposit to an earlier set's address waits to move while its coin is
 	// in a block and not spent by one (a move still in the mempool hasn't
 	// happened yet); until it is credited here it backs nothing owed.

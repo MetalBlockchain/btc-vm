@@ -30,14 +30,18 @@ new set:
 
 The old set's signers keep running, **retired**. A retired signer signs only
 these moves, and only the move its own view of both chains builds:
-- every input is a confirmed coin its own set holds;
+- every input is a confirmed coin its own set holds, and the first is the
+  oldest such coin on that chain (the anchor), so any two moves conflict
+  and at most one confirms;
 - each coin goes where the rule above says, checked against its own record
   of what was credited;
-- the fee rate is within policy;
+- the fee rate is within policy and its own estimate;
 - nothing moves while a release is pending;
 - the peg is still solvent after the move.
 
-The coordinator can't redirect a move. A signer of the new set never signs
+Its signing log records a move by the coins it spends, read from the
+transaction, not by the label the coordinator gives it. The coordinator
+can't redirect a move. A signer of the new set never signs
 a move, and a retired signer signs nothing else.
 
 Each move is tagged `BVMM` with the hash of the new set's script.
