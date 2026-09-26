@@ -12,6 +12,7 @@ replace (
 )
 
 require (
+	filippo.io/age v1.2.1
 	github.com/MetalBlockchain/btcvm/btcd/btcec/v2 v2.3.5
 	github.com/MetalBlockchain/btcvm/btcd/btcutil v0.0.0-00010101000000-000000000000
 	github.com/MetalBlockchain/btcvm/btcd/chaincfg/chainhash v1.1.0
@@ -44,7 +45,6 @@ require (
 )
 
 require (
-	filippo.io/age v1.2.1 // indirect
 	github.com/DataDog/zstd v1.5.2 // indirect
 	github.com/MetalBlockchain/coreth v0.15.4-rc.3-1774987596 // indirect
 	github.com/MetalBlockchain/libevm v1.13.14-0.3.0.rc.6-1774959320 // indirect
