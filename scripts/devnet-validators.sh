@@ -65,10 +65,10 @@ wait_for() { # wait_for SECONDS DESCRIPTION COMMAND...
   local secs=$1 what=$2
   shift 2
   for _ in $(seq "$secs"); do
-    "$@" >/dev/null 2>&1 && return 0
+    "$@" >/dev/null 2>"$DIR/wait.err" && return 0
     sleep 1
   done
-  fail "timed out waiting for $what"
+  fail "timed out waiting for $what${DIR:+: $(tail -1 "$DIR/wait.err" 2>/dev/null)}"
 }
 bootstrapped() { call "$1" info info.isBootstrapped "{\"chain\":\"$2\"}" | grep -q '"isBootstrapped":true'; }
 
@@ -200,6 +200,7 @@ height() { btc 1 getblockcount | jq -r '.result // 0'; }
 height_above() { [[ $(height) -gt $1 ]]; }
 wait_for 60 "the peg reserve block" height_above 0
 DEST=$(jq -r .btcvmAddress "$DIR/builder5.json")
+PAY_AMOUNT=0.001
 builder_of() { # the node whose miningAddrs block H's coinbase pays; 6: no fees to pay
   local block addr i
   block=$(btc 1 getblock "[\"$(btc 1 getblockhash "[$1]" | jq -r .result)\", 2]")
@@ -221,7 +222,7 @@ pay() { # pay COUNT: one payment per block
     h=$(height)
     # The address index can lag the newest block by a moment.
     wait_for 30 "the reserve's coins to be spendable" \
-      "$BIN/btcvm" send -key "$(jq -r .btcvmWIF "$DIR/reserve.json")" -to "$DEST" -amount 0.001
+      "$BIN/btcvm" send -key "$(jq -r .btcvmWIF "$DIR/reserve.json")" -to "$DEST" -amount "$PAY_AMOUNT"
     wait_for 60 "block $((h + 1))" height_above "$h"
   done
 }
