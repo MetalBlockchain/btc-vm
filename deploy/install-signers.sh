@@ -31,7 +31,8 @@ die() { echo "install-signers: $*" >&2; exit 1; }
 [[ $(id -u) == 0 ]] || die "run as root"
 [[ -x $BTCVM ]] || die "can't run $BTCVM"
 shopt -s nullglob
-staged=("$STAGE"/signer[0-9]*)
+staged=("$STAGE"/signer[0-9]*/)
+staged=("${staged[@]%/}")
 [[ ${#staged[@]} -ge 1 ]] || die "nothing staged in $STAGE; run deploy/stage-signers.sh first"
 
 install -d -o root -g root -m 755 "$(dirname "$BIN")"

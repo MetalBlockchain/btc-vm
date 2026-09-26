@@ -74,14 +74,15 @@ func (h *healthChecker) run(state *pegState, loadErr error) []check {
 	return checks
 }
 
-// rotation reports what sets this one replaced still hold, and fails if a
-// coin has waited too long to move: its retired signers may be down.
+// rotation reports what sets this one replaced still hold. It fails if a
+// deposit that arrived at an old address has waited well past the blocks a
+// move takes: its retired signers may be down, or the surplus can't cover
+// the fee. (A move of the old set's own coins that stalls leaves withdrawals
+// unpaid, which the bridge check reports.)
 func (h *healthChecker) rotation(s *pegState) check {
 	var btc, vm int64
-	oldest := int64(0)
 	for _, u := range s.legacyUTXOs {
 		btc += u.value
-		oldest = max(oldest, u.confirmations)
 	}
 	for _, u := range s.legacyReserve {
 		vm += u.value
@@ -90,8 +91,11 @@ func (h *healthChecker) rotation(s *pegState) check {
 		return check{"rotation", true, fmt.Sprintf("the %d replaced set(s) hold nothing; their signers may retire once nothing more arrives at their addresses", len(h.b.signers.prior))}
 	}
 	detail := fmt.Sprintf("replaced sets still hold %s BTC on Bitcoin and %s BTC of reserve on BTCVM, moving to this set", formatBTC(btc), formatBTC(vm))
-	if oldest > h.stallBlocks+6 {
-		return check{"rotation", false, detail + fmt.Sprintf("; a coin has waited %d blocks: are the retired signers up, and is the surplus enough for the fee?", oldest)}
+	for _, d := range s.legacyDeposits {
+		if d.confirmations > h.b.confirmationsFor(d.value)+h.stallBlocks {
+			return check{"rotation", false, fmt.Sprintf("%s; deposit %v to an old address has %d confirmations and has not moved: are the retired signers up, and does the surplus cover the fee?",
+				detail, d.outPoint, d.confirmations)}
+		}
 	}
 	return check{"rotation", true, detail}
 }
