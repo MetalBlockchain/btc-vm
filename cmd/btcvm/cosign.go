@@ -1344,8 +1344,12 @@ func (l *signingLog) volumeSince(t time.Time) int64 {
 // cmdSignerKey makes the key for one separate signer. Its operator runs it
 // on the signer's own machine and shares only the public key.
 func cmdSignerKey(args []string) error {
+	if len(args) > 0 && args[0] == "encrypt" {
+		return cmdSignerKeyEncrypt(args[1:])
+	}
 	fs := flag.NewFlagSet("signer-key", flag.ExitOnError)
-	out := fs.String("out", "", "file to write the private key to (hex, mode 0600; never commit it)")
+	out := fs.String("out", "", "file to write the private key to (mode 0600; never commit it)")
+	plaintext := fs.Bool("plaintext-key", false, "write the key as plain hex (by default it is encrypted with a passphrase, from the terminal or $"+passphraseEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1357,15 +1361,14 @@ func cmdSignerKey(args []string) error {
 		return err
 	}
 	key, _ := btcec.PrivKeyFromBytes(secret[:])
-	f, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
+	passphrase := ""
+	if !*plaintext {
+		var err error
+		if passphrase, err = newPassphrase(newPrompter(false)); err != nil {
+			return err
+		}
 	}
-	if _, err := fmt.Fprintln(f, hex.EncodeToString(secret[:])); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
+	if err := writeKey(*out, key, passphrase); err != nil {
 		return err
 	}
 	logPath := filepath.Join(filepath.Dir(*out), "signing-log.json")
@@ -1375,28 +1378,6 @@ func cmdSignerKey(args []string) error {
 	printJSON(map[string]string{"keyFile": *out, "signingLog": logPath,
 		"publicKey": hex.EncodeToString(key.PubKey().SerializeCompressed())})
 	return nil
-}
-
-// readKeyFile reads a signer's hex private key, refusing a file other users
-// can read.
-func readKeyFile(path string) (*btcec.PrivateKey, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("%s is readable by other users; chmod 600 it", path)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	secret, err := hex.DecodeString(strings.TrimSpace(string(raw)))
-	if err != nil || len(secret) != 32 {
-		return nil, fmt.Errorf("%s must hold a 32-byte hex private key", path)
-	}
-	key, _ := btcec.PrivKeyFromBytes(secret)
-	return key, nil
 }
 
 func cmdSigner(args []string) error {

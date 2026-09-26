@@ -105,11 +105,11 @@ func TestCardSignsItsTransportPin(t *testing.T) {
 func TestInitMakesTransportKeyForHTTPS(t *testing.T) {
 	require := require.New(t)
 	dir := t.TempDir()
-	require.ErrorContains(setupInit([]string{"-yes", "-dir", filepath.Join(dir, "a"), "-name", "A", "-url", "http://signer.example:9700"}),
+	require.ErrorContains(setupInit([]string{"-yes", "-dir", filepath.Join(dir, "a"), "-name", "A", "-url", "http://signer.example:9700", "-plaintext-key"}),
 		"never plain http")
 
 	b := filepath.Join(dir, "b")
-	require.NoError(setupInit([]string{"-yes", "-dir", b, "-name", "B", "-url", "https://signer.example:9700"}))
+	require.NoError(setupInit([]string{"-yes", "-dir", b, "-name", "B", "-url", "https://signer.example:9700", "-plaintext-key"}))
 	raw, err := os.ReadFile(filepath.Join(b, cardFileName))
 	require.NoError(err)
 	var card operatorCard

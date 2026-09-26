@@ -281,6 +281,7 @@ func setupInit(args []string) error {
 	importFile := fs.String("import-key-file", "", "import an existing private key (hex or WIF) from this file, instead of making one")
 	importStdin := fs.Bool("import-key-stdin", false, "import an existing private key (hex or WIF) from stdin, instead of making one")
 	yes := fs.Bool("yes", false, "no questions: take everything from flags (for scripts and agents)")
+	plaintext := fs.Bool("plaintext-key", false, "write the key unencrypted (by default it is encrypted with a passphrase, from the terminal or $"+passphraseEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -353,10 +354,16 @@ func setupInit(args []string) error {
 		key, _ = btcec.PrivKeyFromBytes(secret[:])
 	}
 
+	passphrase := ""
+	if !*plaintext {
+		if passphrase, err = newPassphrase(p); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(*dir, 0o700); err != nil {
 		return err
 	}
-	if err := writeNew(keyPath, []byte(hex.EncodeToString(key.Serialize())+"\n"), 0o600); err != nil {
+	if err := writeKey(keyPath, key, passphrase); err != nil {
 		return err
 	}
 	// The signing log is born with the key: from now on a missing log means
@@ -724,6 +731,12 @@ BITCOIN_RPC_PASS=
 			return err
 		}
 	}
+	// An encrypted key's passphrase reaches the service as a systemd
+	// credential, sealed to this machine (its TPM, where it has one).
+	credential, credPath := "", filepath.Join(*dir, "passphrase.cred")
+	if raw, err := os.ReadFile(filepath.Join(*dir, keyFileName)); err == nil && isEncryptedKey(raw) {
+		credential = fmt.Sprintf("LoadCredentialEncrypted=%s:%s\n", passphraseCredential, credPath)
+	}
 	unit := fmt.Sprintf(`[Unit]
 Description=BTCVM peg signer (%s)
 After=network-online.target
@@ -732,7 +745,7 @@ Wants=network-online.target
 [Service]
 User=%s
 EnvironmentFile=%s
-ExecStart=%s signer -signers %s -key-file %s -listen %s -log %s -deposits %s -max-daily %d
+%sExecStart=%s signer -signers %s -key-file %s -listen %s -log %s -deposits %s -max-daily %d
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -751,7 +764,7 @@ ReadWritePaths=%s
 
 [Install]
 WantedBy=multi-user.target
-`, operatorName(set, me), *user, envPath, *bin, installed, filepath.Join(*dir, keyFileName), *listen,
+`, operatorName(set, me), *user, envPath, credential, *bin, installed, filepath.Join(*dir, keyFileName), *listen,
 		filepath.Join(*dir, signingLogKey), filepath.Join(*dir, "deposits.json"), daily, *dir)
 	unitPath := filepath.Join(*dir, unitFileName)
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
@@ -760,10 +773,16 @@ WantedBy=multi-user.target
 
 	fmt.Fprintf(p.out, `Joined. Next:
   1. Fill in %s with this signer's own Bitcoin Core and BTCVM nodes.
-  2. Install the service:  sudo cp %s /etc/systemd/system/ && sudo systemctl enable --now btcvm-signer
+`, envPath)
+	if credential != "" {
+		fmt.Fprintf(p.out, `     Seal the key's passphrase for the service (type it, then Ctrl-D):
+       sudo systemd-creds encrypt --name=%s --with-key=auto - %s
+`, passphraseCredential, credPath)
+	}
+	fmt.Fprintf(p.out, `  2. Install the service:  sudo cp %s /etc/systemd/system/ && sudo systemctl enable --now btcvm-signer
   3. Check everything:     btcvm signer-setup check -dir %s
   4. Tell the coordinator you are up.
-`, envPath, unitPath, *dir)
+`, unitPath, *dir)
 	printJSON(map[string]string{"fingerprint": set.fingerprint(), "signerSet": installed, "env": envPath, "service": unitPath})
 	return nil
 }

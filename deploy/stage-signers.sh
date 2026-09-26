@@ -52,13 +52,15 @@ echo "Staging $required of $total signers in $STAGE"
 mkdir -m 700 "$STAGE"
 [ -n "$RUN_AS" ] && chown "$RUN_AS" "$STAGE"
 
-# 1. One signer per key, in the live set's order.
+# 1. One signer per key, in the live set's order. The keys come from a
+#    plaintext set file, so they stay plaintext here; keys born on
+#    operators' own machines (signer-setup init) are encrypted.
 cards=()
 for ((i = 0; i < total; i++)); do
   n=$((i + 1))
   python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["privateKeys"][int(sys.argv[2])])' "$SOURCE" "$i" |
     as "$BTCVM" signer-setup init -yes -dir "$STAGE/signer$n" -name "Signer $n" \
-      -url "http://127.0.0.1:970$n" -import-key-stdin 2>/dev/null >/dev/null
+      -url "http://127.0.0.1:970$n" -import-key-stdin -plaintext-key 2>/dev/null >/dev/null
   cards+=("$STAGE/signer$n/card.json")
 done
 

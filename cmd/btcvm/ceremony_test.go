@@ -43,6 +43,10 @@ func answering(t *testing.T, input string) {
 func ceremony(t *testing.T, h *harness) (coordKey string, set *signerSet, dirs []string) {
 	require := require.New(t)
 	root := t.TempDir()
+	// Every key is encrypted, with the passphrase from a file.
+	passFile := filepath.Join(root, "passphrase")
+	require.NoError(os.WriteFile(passFile, []byte("correct horse battery staple\n"), 0o600))
+	t.Setenv(passphraseEnv, passFile)
 	var cards []string
 	for i, key := range h.b.signers.privKeys {
 		dir := filepath.Join(root, "signer"+strconv.Itoa(i))
@@ -66,6 +70,10 @@ func ceremony(t *testing.T, h *harness) (coordKey string, set *signerSet, dirs [
 			require.NoError(setupInit([]string{"-yes", "-dir", dir, "-name", "Signer " + strconv.Itoa(i), "-url", url, "-import-key-file", keyFile}))
 		}
 		cards = append(cards, filepath.Join(dir, cardFileName))
+		sealed, err := os.ReadFile(filepath.Join(dir, keyFileName))
+		require.NoError(err)
+		require.True(isEncryptedKey(sealed), "keys are encrypted at rest")
+		require.NotContains(string(sealed), hex.EncodeToString(key.Serialize()))
 		imported, err := readKeyFile(filepath.Join(dir, keyFileName))
 		require.NoError(err)
 		require.True(imported.PubKey().IsEqual(key.PubKey()))
@@ -110,6 +118,8 @@ func ceremony(t *testing.T, h *harness) (coordKey string, set *signerSet, dirs [
 		unit, err := os.ReadFile(filepath.Join(dir, unitFileName))
 		require.NoError(err)
 		require.Contains(string(unit), "-key-file "+filepath.Join(dir, keyFileName))
+		require.Contains(string(unit), "LoadCredentialEncrypted="+passphraseCredential+":"+filepath.Join(dir, "passphrase.cred"),
+			"the service gets the key's passphrase as a sealed credential")
 		if i == 0 {
 			require.Contains(string(unit), "-max-daily 50000000000")
 		}
