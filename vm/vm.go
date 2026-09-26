@@ -72,6 +72,9 @@ type VM struct {
 	p2pNetwork    *p2p.Network
 	p2pValidators *p2p.Validators
 
+	// Signs the L1's validator changes an admin approved (validator_manager.go).
+	validatorManager *validatorManager
+
 	// Bitcoin components (legacy, kept for compatibility)
 	chain *blockchain.BlockChain
 
@@ -238,6 +241,16 @@ func (vm *VM) Initialize(
 	}
 	vm.p2pNetwork = p2pNet
 	vm.ctx.Log.Info("p2p network initialized successfully")
+
+	admins, err := parseValidatorAdmins(configBytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse chain config: %w", err)
+	}
+	vm.validatorManager, err = newValidatorManager(vm, p2pNet, admins)
+	if err != nil {
+		return err
+	}
+	vm.ctx.Log.Info("validator manager ready", zap.Int("validatorAdmins", admins.Len()))
 
 	// Note: Unified gossip system will be initialized in onNormalOperationsStarted()
 	// when SetState(snow.NormalOp) is called
@@ -742,7 +755,8 @@ func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 	)
 
 	return map[string]http.Handler{
-		"/rpc": rpcHandler,
-		"/ws":  wsHandler,
+		"/rpc":        rpcHandler,
+		"/ws":         wsHandler,
+		"/validators": vm.validatorManager,
 	}, nil
 }

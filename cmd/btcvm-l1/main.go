@@ -9,6 +9,8 @@
 //	    node at -node-uri, printing the IDs as JSON
 //	btcvm-l1 node-id -cert staker.crt
 //	    the NodeID a node's staking certificate gives it (to check a backup)
+//	btcvm-l1 request | approve | register | remove | top-up | validators
+//	    add and remove the L1's validators (validators.go)
 //
 // -uri is the P-Chain API to use (default: -node-uri).
 package main
@@ -50,7 +52,7 @@ type keyFile struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: btcvm-l1 key|balance|create [flags]")
+		fmt.Fprintln(os.Stderr, "usage: btcvm-l1 key|balance|addresses|import|create|node-id|request|approve|register|remove|top-up|validators [flags]")
 		os.Exit(2)
 	}
 	var err error
@@ -67,6 +69,18 @@ func main() {
 		err = cmdCreate(os.Args[2:])
 	case "node-id":
 		err = cmdNodeID(os.Args[2:])
+	case "request":
+		err = cmdRequest(os.Args[2:])
+	case "approve":
+		err = cmdApprove(os.Args[2:])
+	case "register":
+		err = cmdRegister(os.Args[2:])
+	case "remove":
+		err = cmdRemove(os.Args[2:])
+	case "top-up":
+		err = cmdTopUp(os.Args[2:])
+	case "validators":
+		err = cmdValidators(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}

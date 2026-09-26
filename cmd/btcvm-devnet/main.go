@@ -13,6 +13,8 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/genesis"
 	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/metalgo/utils/constants"
+	"github.com/MetalBlockchain/metalgo/utils/formatting/address"
 	"github.com/MetalBlockchain/metalgo/vms/secp256k1fx"
 	"github.com/MetalBlockchain/metalgo/wallet/subnet/primary"
 
@@ -24,8 +26,15 @@ func main() {
 	genesisPath := flag.String("genesis", "", "BTCVM genesis JSON file")
 	subnetFlag := flag.String("subnet", "", "existing subnet ID (default: create one)")
 	name := flag.String("name", "btcvm", "chain name")
+	ewoqKeyOut := flag.String("ewoq-key-out", "", "write the local network's pre-funded (public) ewoq key as a btcvm-l1 key file, and exit")
 	flag.Parse()
 
+	if *ewoqKeyOut != "" {
+		if err := writeEWOQKey(*ewoqKeyOut); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *genesisPath == "" {
 		log.Fatal("-genesis is required")
 	}
@@ -77,4 +86,21 @@ func main() {
 		"chainID":  tx.ID().String(),
 	})
 	fmt.Println(string(out))
+}
+
+// writeEWOQKey writes the ewoq key in btcvm-l1's key file format, for
+// devnet scripts. The key is public: it only ever holds local-network funds.
+func writeEWOQKey(path string) error {
+	addr, err := address.Format("P", constants.GetHRP(constants.LocalID), genesis.EWOQKey.Address().Bytes())
+	if err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(map[string]string{
+		"privateKey":    genesis.EWOQKey.String(),
+		"pChainAddress": addr,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
 }
