@@ -16,6 +16,7 @@ package main
 //	candidate:  btcvm-l1 register -registration registration.json -key my-p-chain-key.json -balance 1
 //	admin:      btcvm-l1 remove -validation-id ... -key admin-key.json -node-uri ... -rpc-pass-file ...
 //	anyone:     btcvm-l1 top-up -validation-id ... -key p-chain-key.json -balance 1
+//	owner:      btcvm-l1 disable -validation-id ... -key owner-key.json   (ends it; the unused balance returns to the owner)
 //	anyone:     btcvm-l1 validators -node-uri ...
 //
 // Nothing secret changes hands: a request holds the candidate's NodeID and
@@ -412,6 +413,30 @@ func cmdTopUp(args []string) error {
 		return err
 	}
 	tx, err := wallet.IssueIncreaseL1ValidatorBalanceTx(validationID, uint64(*balance*float64(units.Avax)))
+	if err != nil {
+		return err
+	}
+	return printJSON(map[string]string{"validationID": validationID.String(), "txID": tx.ID().String()})
+}
+
+// cmdDisable ends a validator from its owner's side: the P-Chain stops it
+// and returns the rest of its balance to the owner. (Its weight stays on the
+// L1's books until an admin removes it, but it no longer validates.)
+func cmdDisable(args []string) error {
+	fs := flag.NewFlagSet("disable", flag.ExitOnError)
+	validationFlag := fs.String("validation-id", "", "the validator's validation ID")
+	keyPath := fs.String("key", "", "the validator's owner key (the -owner of its request)")
+	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
+	_ = fs.Parse(args)
+	validationID, err := ids.FromString(*validationFlag)
+	if err != nil {
+		return fmt.Errorf("-validation-id: %w", err)
+	}
+	wallet, err := pWallet(*uri, *keyPath)
+	if err != nil {
+		return err
+	}
+	tx, err := wallet.IssueDisableL1ValidatorTx(validationID)
 	if err != nil {
 		return err
 	}

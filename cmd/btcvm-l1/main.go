@@ -52,7 +52,7 @@ type keyFile struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: btcvm-l1 key|balance|addresses|import|create|node-id|request|approve|register|remove|top-up|validators [flags]")
+		fmt.Fprintln(os.Stderr, "usage: btcvm-l1 key|balance|addresses|import|create|node-id|request|approve|register|remove|top-up|disable|validators [flags]")
 		os.Exit(2)
 	}
 	var err error
@@ -81,6 +81,8 @@ func main() {
 		err = cmdTopUp(os.Args[2:])
 	case "validators":
 		err = cmdValidators(os.Args[2:])
+	case "disable":
+		err = cmdDisable(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
