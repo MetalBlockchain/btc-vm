@@ -38,12 +38,39 @@ type signerSet struct {
 	Operators      []operatorCard `json:"operators,omitempty"`
 	CoordinatorKey string         `json:"coordinatorKey,omitempty"` // hex; signs every request to the signers
 	Policy         *pegPolicy     `json:"policy,omitempty"`
+	// Previous are the sets this one replaced, newest first. Coins still
+	// held by them are the peg's too: their signers, now retired, sign only
+	// transactions moving those coins to this set (see rotate.go).
+	Previous []priorSet `json:"previous,omitempty"`
 
 	path         string // the file it was read from, if any
+	prior        []*signerSet
 	redeemScript []byte
 	pubKeys      []*btcec.PublicKey
 	privKeys     []*btcec.PrivateKey
 	coordKey     *btcec.PublicKey
+}
+
+// priorSet is a signer set a later one replaced: its keys and threshold,
+// which fix its scripts and addresses.
+type priorSet struct {
+	Required   int      `json:"required"`
+	PublicKeys []string `json:"publicKeys"`
+}
+
+// lineage is the set and the sets it replaced, newest first.
+func (s *signerSet) lineage() []*signerSet {
+	return append([]*signerSet{s}, s.prior...)
+}
+
+// retired is the prior set pub belongs to, or nil if it belongs to none.
+func (s *signerSet) retired(pub *btcec.PublicKey) *signerSet {
+	for _, p := range s.prior {
+		if p.indexOf(pub) >= 0 {
+			return p
+		}
+	}
+	return nil
 }
 
 type setNetworks struct {
@@ -79,7 +106,10 @@ func (s *signerSet) fingerprint() string {
 		Operators      []operatorCard `json:"operators"`
 		CoordinatorKey string         `json:"coordinatorKey"`
 		Policy         *pegPolicy     `json:"policy"`
-	}{s.Required, s.PublicKeys, s.Networks, s.Operators, s.CoordinatorKey, s.Policy})
+		// Omitted when empty, so sets made before rotation keep their
+		// fingerprint.
+		Previous []priorSet `json:"previous,omitempty"`
+	}{s.Required, s.PublicKeys, s.Networks, s.Operators, s.CoordinatorKey, s.Policy, s.Previous})
 	sum := sha256.Sum256(agreed)
 	h := hex.EncodeToString(sum[:10])
 	return strings.Join([]string{h[0:4], h[4:8], h[8:12], h[12:16], h[16:20]}, "-")
@@ -183,8 +213,23 @@ func (s *signerSet) load() error {
 	}
 
 	var err error
-	s.redeemScript, err = txscript.MultiSigScript(addrs, s.Required)
-	return err
+	if s.redeemScript, err = txscript.MultiSigScript(addrs, s.Required); err != nil {
+		return err
+	}
+	s.prior = nil
+	seen := map[string]bool{string(s.redeemScript): true}
+	for i, p := range s.Previous {
+		prior := &signerSet{Required: p.Required, PublicKeys: p.PublicKeys}
+		if err := prior.load(); err != nil {
+			return fmt.Errorf("previous set %d: %w", i+1, err)
+		}
+		if seen[string(prior.redeemScript)] {
+			return fmt.Errorf("previous set %d repeats an earlier set", i+1)
+		}
+		seen[string(prior.redeemScript)] = true
+		s.prior = append(s.prior, prior)
+	}
+	return nil
 }
 
 // address returns the peg P2WSH address on the network params encode.
@@ -269,8 +314,10 @@ func (s *signerSet) spendsPeg(tx *wire.MsgTx) bool {
 		if len(in.Witness) == 0 {
 			continue
 		}
-		if _, ok := s.pegWitness(in.Witness[len(in.Witness)-1]); ok {
-			return true
+		for _, set := range s.lineage() {
+			if _, ok := set.pegWitness(in.Witness[len(in.Witness)-1]); ok {
+				return true
+			}
 		}
 	}
 	return false

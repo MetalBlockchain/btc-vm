@@ -548,3 +548,98 @@ func TestFailedImportIsRetried(t *testing.T) {
 	require.NoError(c.rpc.call(&info, "getaddressinfo", addr.EncodeAddress()))
 	require.True(info.IsMine || info.IsWatchOnly, "the retry imported it")
 }
+
+// TestRotationWithBitcoinCore rotates a peg with history to a new set of
+// signers against a real Bitcoin Core: the move is a valid transaction that
+// confirms, each signer sees the old set's addresses and the new set's from
+// its own wallet, a deposit not yet credited at the change is credited once
+// by the new set, and the new set pays withdrawals.
+func TestRotationWithBitcoinCore(t *testing.T) {
+	require := require.New(t)
+	n := startRegtest(t)
+	h := newCosignHarness(t)
+	wallet := func(name string) *btcChain {
+		s := n.settings
+		s.btcWallet = name
+		c := &btcChain{rpc: s.btcRPCClient()}
+		require.NoError(c.ensureWallet())
+		return c
+	}
+	setup := func(b *bridge, c *btcChain) {
+		b.btc, b.btcParams = c, &chaincfg.RegressionNetParams
+		b.minFeeRate, b.maxFeeRate = 1, 100
+		b.minDeposit, b.minPegOut = 10_000, 30_000
+	}
+	setup(h.b, wallet("btcvm"))
+	h.b.feeRate = func() (int64, error) { return 3, nil }
+	for i, c := range h.signers {
+		setup(c.b, wallet(fmt.Sprintf("signer%d", i)))
+		require.NoError(watchPeg(c.b, false))
+	}
+	require.NoError(watchPeg(h.b, false))
+
+	// History under the first set: alice credited, bob not yet, and a
+	// little untagged BTC at the peg to pay for the moves.
+	alice, bob := h.user(1), h.user(2)
+	aliceAddr, err := registerDeposit(h.b, alice)
+	require.NoError(err)
+	bobAddr, err := registerDeposit(h.b, bob)
+	require.NoError(err)
+	pegAddr, err := h.b.btcPegAddress()
+	require.NoError(err)
+	require.NoError(n.funder.call(nil, "sendtoaddress", aliceAddr.EncodeAddress(), 0.25))
+	require.NoError(n.funder.call(nil, "sendtoaddress", pegAddr.EncodeAddress(), 0.02))
+	n.mine(6)
+	for h.step() != "" {
+		h.vm.mine()
+	}
+	require.Equal(btc/4-h.b.vmFee, creditedTo(h.vm, alice))
+	require.NoError(n.funder.call(nil, "sendtoaddress", bobAddr.EncodeAddress(), 0.1))
+	n.mine(1)
+	require.Empty(h.step(), "bob's deposit waits for confirmations")
+
+	r := h.rotate(t)
+	for i, c := range r.fresh {
+		setup(c.b, wallet(fmt.Sprintf("new%d", i)))
+		require.NoError(watchPeg(c.b, false))
+	}
+	for _, c := range r.retired {
+		require.NoError(watchPeg(c.b, false))
+	}
+	require.NoError(watchPeg(h.b, false))
+
+	require.Contains(h.step(), "reserve")
+	h.vm.mine()
+	require.Contains(h.step(), "Bitcoin")
+	n.mine(1)
+	a := h.audit()
+	require.True(a.solvent(), "%+v", a)
+	s, err := h.b.load()
+	require.NoError(err)
+	require.Empty(s.legacyUTXOs, "the old set holds nothing on Bitcoin")
+
+	// Bob's deposit is credited once, by the new set.
+	n.mine(6)
+	for h.step() != "" {
+		h.vm.mine()
+	}
+	require.Equal(btc/10-h.b.vmFee, creditedTo(h.vm, bob))
+	require.Equal(btc/4-h.b.vmFee, creditedTo(h.vm, alice))
+
+	// The new set pays a withdrawal from its own coins, on Bitcoin.
+	aliceOnBTC := n.newAddress()
+	h.pegOut(btc/20, aliceOnBTC)
+	did, err := h.b.step()
+	require.NoError(err)
+	require.Contains(did, "paid")
+	n.mine(1)
+	require.Empty(h.step())
+	a = h.audit()
+	require.True(a.solvent(), "%+v", a)
+	require.Zero(a.PendingPegOuts)
+	for _, c := range r.fresh {
+		s, err := c.b.load()
+		require.NoError(err)
+		require.True(c.b.audit(s).solvent(), "each new signer sees a solvent peg on its own node")
+	}
+}

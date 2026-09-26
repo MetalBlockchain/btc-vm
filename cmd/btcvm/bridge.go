@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/MetalBlockchain/btcvm/btcd/btcutil"
@@ -73,6 +74,11 @@ type deposit struct {
 	dest          destination
 	valid         bool // has a destination and meets the minimum
 	confirmations int64
+	// hasDest: the destination is known (a personal deposit address, or a
+	// BVMD tag), whether or not the deposit is valid.
+	hasDest bool
+	// legacy: paid to an address of a set this one replaced.
+	legacy bool
 }
 
 type pegOut struct {
@@ -86,11 +92,22 @@ type pegOut struct {
 
 // pegState is everything the bridge knows, read from both chains.
 type pegState struct {
-	redeemFor      map[string][]byte      // Bitcoin peg output script -> redeem script
-	depositDest    map[string]destination // personal deposit script -> its destination
-	reserveCreated int64                  // reserve paid in by consensus (coinbases)
-	reserveUnspent int64                  // reserve still held
+	redeemFor   map[string][]byte      // Bitcoin peg output script -> redeem script
+	depositDest map[string]destination // personal deposit script -> its destination
+	setFor      map[string]*signerSet  // Bitcoin peg output script -> the set holding it
+	// legacyDeposits are deposits to an earlier set's addresses not
+	// credited or refunded: they are moved to this set's address for the
+	// same destination, and credited there (rotate.go).
+	legacyDeposits []deposit
+	reserveCreated int64 // reserve paid in by consensus (coinbases)
+	reserveUnspent int64 // reserve still held
 	reserveUTXOs   []utxo
+	// legacyReserve and legacyUTXOs are confirmed coins still held by a
+	// set this one replaced, on BTCVM and on Bitcoin. They back the peg
+	// like any other, but only their own set's signers can move them, and
+	// only to this set (rotate.go).
+	legacyReserve []utxo
+	legacyUTXOs   []utxo
 	// reserveAnchor and pegAnchor are the oldest confirmed coins of the
 	// reserve and the peg, whether or not a transaction in a mempool spends
 	// them. Every release spends reserveAnchor, and every payout and refund
@@ -143,27 +160,35 @@ func (b *bridge) btcPegAddress() (btcutil.Address, error) {
 // address and each registered personal deposit address. It fills
 // s.redeemFor and returns the destination of each deposit script.
 func (b *bridge) btcWatchSet(s *pegState) ([]btcutil.Address, map[string]destination, error) {
-	pegAddr, err := b.btcPegAddress()
-	if err != nil {
-		return nil, nil, err
-	}
-	addrs := []btcutil.Address{pegAddr}
-	s.redeemFor = map[string][]byte{string(b.signers.pkScript()): b.signers.redeemScript}
-	depositDest := map[string]destination{}
-
 	dests, err := b.registry.list()
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, d := range dests {
-		redeem := b.signers.depositRedeemScript(d)
-		addr, err := b.signers.depositAddress(d, b.btcParams)
+	var addrs []btcutil.Address
+	s.redeemFor = map[string][]byte{}
+	s.setFor = map[string]*signerSet{}
+	depositDest := map[string]destination{}
+	// Every set's addresses: the current set's, and the earlier sets',
+	// whose coins are moved to this set and where late deposits may arrive.
+	for _, set := range b.signers.lineage() {
+		pegAddr, err := set.address(b.btcParams)
 		if err != nil {
 			return nil, nil, err
 		}
-		addrs = append(addrs, addr)
-		s.redeemFor[string(p2wshScript(redeem))] = redeem
-		depositDest[string(p2wshScript(redeem))] = d
+		addrs = append(addrs, pegAddr)
+		s.redeemFor[string(set.pkScript())] = set.redeemScript
+		s.setFor[string(set.pkScript())] = set
+		for _, d := range dests {
+			redeem := set.depositRedeemScript(d)
+			addr, err := set.depositAddress(d, b.btcParams)
+			if err != nil {
+				return nil, nil, err
+			}
+			addrs = append(addrs, addr)
+			s.redeemFor[string(p2wshScript(redeem))] = redeem
+			s.setFor[string(p2wshScript(redeem))] = set
+			depositDest[string(p2wshScript(redeem))] = d
+		}
 	}
 	return addrs, depositDest, nil
 }
@@ -199,6 +224,30 @@ func outputsTo(tx *wire.MsgTx, script []byte) (map[wire.OutPoint]bool, int64) {
 
 func (b *bridge) load() (*pegState, error) {
 	script := b.signers.pkScript()
+	// Every set's peg script holds the reserve on BTCVM: the current set's,
+	// and those of the sets it replaced until their coins have moved.
+	lineageScripts := map[string]bool{}
+	var reserveAddrs []btcutil.Address
+	for _, set := range b.signers.lineage() {
+		lineageScripts[string(set.pkScript())] = true
+		addr, err := set.address(b.vmParams)
+		if err != nil {
+			return nil, err
+		}
+		reserveAddrs = append(reserveAddrs, addr)
+	}
+	paidToReserve := func(tx *wire.MsgTx) (map[wire.OutPoint]bool, int64) {
+		hash := tx.TxHash()
+		outs := map[wire.OutPoint]bool{}
+		var total int64
+		for i, out := range tx.TxOut {
+			if lineageScripts[string(out.PkScript)] {
+				outs[wire.OutPoint{Hash: hash, Index: uint32(i)}] = true
+				total += out.Value
+			}
+		}
+		return outs, total
+	}
 	s := &pegState{
 		released: map[wire.OutPoint]chainhash.Hash{},
 		paid:     map[chainhash.Hash]chainhash.Hash{},
@@ -209,23 +258,19 @@ func (b *bridge) load() (*pegState, error) {
 	}
 
 	// BTCVM side.
-	reserveAddr, err := b.vmReserveAddress()
-	if err != nil {
-		return nil, err
-	}
-	vmTxs, err := b.vm.txsFor([]btcutil.Address{reserveAddr})
+	vmTxs, err := b.vm.txsFor(reserveAddrs)
 	if err != nil {
 		return nil, fmt.Errorf("reading BTCVM reserve: %w", err)
 	}
 	reserveOuts := map[wire.OutPoint]bool{}
 	for _, t := range vmTxs {
-		outs, _ := outputsTo(t.tx, script)
+		outs, _ := paidToReserve(t.tx)
 		for op := range outs {
 			reserveOuts[op] = true
 		}
 	}
 	for _, t := range vmTxs {
-		_, paidIn := outputsTo(t.tx, script)
+		_, paidIn := paidToReserve(t.tx)
 		switch {
 		case isCoinbase(t.tx):
 			if t.confirmations > 0 {
@@ -245,8 +290,9 @@ func (b *bridge) load() (*pegState, error) {
 			}
 			dest, ok := parseDestinationTag(t.tx, tagPegOut)
 			// A payout to the peg address itself would look like change on
-			// Bitcoin, so it is never made.
-			ok = ok && !bytes.Equal(dest.pkScript(), script)
+			// Bitcoin, so it is never made. Nor to an earlier set's: that
+			// would give the retired signers new coins to move.
+			ok = ok && !lineageScripts[string(dest.pkScript())]
 			p := pegOut{time: t.time, txid: t.tx.TxHash(), value: paidIn, dest: dest,
 				valid: ok && paidIn >= b.minPegOut, confirmations: t.confirmations}
 			if p.valid {
@@ -265,7 +311,7 @@ func (b *bridge) load() (*pegState, error) {
 			signerSpends[t.tx.TxHash()] = true
 		}
 	}
-	held, err := b.vm.unspent([]btcutil.Address{reserveAddr}, 0)
+	held, err := b.vm.unspent(reserveAddrs, 0)
 	if err != nil {
 		return nil, fmt.Errorf("reading BTCVM reserve: %w", err)
 	}
@@ -279,9 +325,12 @@ func (b *bridge) load() (*pegState, error) {
 			spentByKnown[in.PreviousOutPoint] = true
 		}
 	}
+	// Only the current set's coins pay releases, and so only they can be
+	// the anchor; an earlier set's coins only move to this set.
+	current := func(u utxo) bool { return bytes.Equal(u.pkScript, script) }
 	var reserveCoins []utxo
 	for _, u := range held {
-		if u.confirmations > 0 {
+		if u.confirmations > 0 && current(u) {
 			reserveCoins = append(reserveCoins, u)
 		}
 	}
@@ -294,8 +343,12 @@ func (b *bridge) load() (*pegState, error) {
 			continue
 		}
 		s.reserveUnspent += u.value
-		if u.confirmations > 0 {
+		switch {
+		case u.confirmations == 0:
+		case current(u):
 			s.reserveUTXOs = append(s.reserveUTXOs, u)
+		default:
+			s.legacyReserve = append(s.legacyReserve, u)
 		}
 	}
 
@@ -344,11 +397,13 @@ func (b *bridge) load() (*pegState, error) {
 					s.refunded[deposit] = hash
 				}
 			}
-			// A payout to a personal deposit address is a deposit to it.
+			// A payout to a personal deposit address is a deposit to it; so
+			// is a retired set's move of a deposit to this set's address.
 			for i, out := range t.tx.TxOut {
 				if dest, personal := depositDest[string(out.PkScript)]; personal {
 					all = append(all, deposit{time: t.time, outPoint: wire.OutPoint{Hash: hash, Index: uint32(i)},
-						value: out.Value, dest: dest, valid: b.depositInRange(out.Value), confirmations: t.confirmations})
+						value: out.Value, dest: dest, valid: b.depositInRange(out.Value), confirmations: t.confirmations,
+						hasDest: true, legacy: s.setFor[string(out.PkScript)] != b.signers})
 				}
 			}
 			continue
@@ -362,16 +417,18 @@ func (b *bridge) load() (*pegState, error) {
 				value:         out.Value,
 				confirmations: t.confirmations,
 			}
+			owner := s.setFor[string(out.PkScript)]
 			switch dest, personal := depositDest[string(out.PkScript)]; {
 			case personal:
 				// A personal deposit address names its destination.
-				d.dest, d.valid = dest, b.depositInRange(out.Value)
-			case bytes.Equal(out.PkScript, script):
+				d.dest, d.valid, d.hasDest = dest, b.depositInRange(out.Value), true
+			case owner != nil:
 				// The shared peg address needs a BVMD tag.
-				d.dest, d.valid = tagDest, hasTag && b.depositInRange(out.Value)
+				d.dest, d.valid, d.hasDest = tagDest, hasTag && b.depositInRange(out.Value), hasTag
 			default:
 				continue
 			}
+			d.legacy = owner != b.signers
 			all = append(all, d)
 		}
 	}
@@ -380,6 +437,14 @@ func (b *bridge) load() (*pegState, error) {
 		switch {
 		case s.refunded[d.outPoint] != (chainhash.Hash{}):
 			s.settled = append(s.settled, d)
+		case d.legacy:
+			// Only this set credits, and only at its own addresses: a
+			// deposit to an earlier set's address is moved here first. One
+			// already credited is simply part of the peg. Which are still
+			// to move is settled below, once the coins are read.
+			if _, credited := s.released[d.outPoint]; !credited {
+				s.legacyDeposits = append(s.legacyDeposits, d)
+			}
 		case d.valid:
 			s.deposits = append(s.deposits, d)
 		default:
@@ -440,7 +505,45 @@ func (b *bridge) load() (*pegState, error) {
 	for op := range pendingSpent {
 		pegCoins = append(pegCoins, confirmedCoin[op])
 	}
-	s.pegAnchor = oldestCoin(pegCoins)
+
+	// The current set pays only from its own coins; an earlier set's coins
+	// only move here (rotate.go). Anchor and payouts use the current set's.
+	var mine []utxo
+	for _, u := range s.lockedUTXOs {
+		if s.setFor[string(u.pkScript)] == b.signers {
+			mine = append(mine, u)
+		} else if u.confirmations > 0 {
+			s.legacyUTXOs = append(s.legacyUTXOs, u)
+		}
+	}
+	s.lockedUTXOs = mine
+	var currentCoins []utxo
+	for _, u := range pegCoins {
+		if s.setFor[string(u.pkScript)] == b.signers {
+			currentCoins = append(currentCoins, u)
+		}
+	}
+	s.pegAnchor = oldestCoin(currentCoins)
+	// A deposit to an earlier set's address waits to move while its coin is
+	// in a block and not spent by one (a move still in the mempool hasn't
+	// happened yet); until it is credited here it backs nothing owed.
+	open := map[wire.OutPoint]bool{}
+	for _, u := range s.legacyUTXOs {
+		open[u.outPoint] = true
+	}
+	for op := range pendingSpent {
+		open[op] = true
+	}
+	var waiting []deposit
+	for _, d := range s.legacyDeposits {
+		if open[d.outPoint] {
+			waiting = append(waiting, d)
+			if !d.valid || !d.hasDest {
+				s.unclaimedOnBTC += d.value // owed to no one yet
+			}
+		}
+	}
+	s.legacyDeposits = waiting
 
 	// Oldest first, so the bridge works through them in order.
 	sort.Slice(s.deposits, func(i, j int) bool {
@@ -461,6 +564,13 @@ func (b *bridge) audit(s *pegState) audit {
 	}
 	for _, d := range s.deposits {
 		if _, done := s.released[d.outPoint]; !done && d.confirmations > 0 {
+			a.PendingPegIns += d.value
+		}
+	}
+	// A creditable deposit to an earlier set's address is owed as much as
+	// one to this set's: it moves here and is credited (rotate.go).
+	for _, d := range s.legacyDeposits {
+		if d.valid && d.hasDest {
 			a.PendingPegIns += d.value
 		}
 	}
@@ -493,6 +603,12 @@ func (b *bridge) step() (string, error) {
 	b.syncSigners()
 
 	var failed error
+	// Coins an earlier set still holds move to this one first (rotate.go).
+	moved, err := b.migrate(s)
+	if len(moved) > 0 {
+		return strings.Join(moved, "; "), err
+	}
+	failed = err
 	// Releases chain off each other's reserve change, so wait for the
 	// previous one to be accepted.
 	if !s.vmPending {

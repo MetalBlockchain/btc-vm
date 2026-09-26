@@ -63,8 +63,8 @@ func refundAction(op wire.OutPoint, dest destination) action {
 // (for example TXID:0 and TXID:00) cannot create separate log entries.
 func (a action) key() (string, error) {
 	switch a.Kind {
-	case actionRelease, actionRefund:
-		op, err := parseOutPoint(a.Deposit)
+	case actionRelease, actionRefund, actionMigrate:
+		op, err := parseOutPoint(a.Deposit) // a move: its first input
 		if err != nil {
 			return "", err
 		}
@@ -97,6 +97,9 @@ type proposal struct {
 
 	tx   *wire.MsgTx
 	prev []spent // the output each input spends
+	// set holds the coins the transaction spends: the current set, unless
+	// it moves an earlier set's coins (rotate.go).
+	set *signerSet
 }
 
 type signRequest struct {
@@ -132,8 +135,12 @@ func parseDest(s string) (destination, error) {
 // holds, if any, then from remote signers.
 func (b *bridge) authorize(p *proposal) error {
 	p.Blocks = b.blockHints(p)
+	set := p.set
+	if set == nil {
+		set = b.signers
+	}
 	sigs := map[int][][]byte{}
-	for i, pub := range b.signers.pubKeys {
+	for i, pub := range set.pubKeys {
 		for _, key := range b.signers.privKeys {
 			if key.PubKey().IsEqual(pub) {
 				s, err := signInputs(p.tx, p.prev, key)
@@ -146,15 +153,15 @@ func (b *bridge) authorize(p *proposal) error {
 	}
 	var failures []string
 	for _, r := range b.cosigners {
-		if len(sigs) >= b.signers.Required {
+		if len(sigs) >= set.Required {
 			break
 		}
-		index, s, err := r.sign(p, b.signers)
+		index, s, err := r.sign(p, set)
 		if err == nil {
 			if _, have := sigs[index]; have {
 				continue
 			}
-			err = b.signers.verifyInputs(p.tx, p.prev, index, s)
+			err = set.verifyInputs(p.tx, p.prev, index, s)
 		}
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", r.URL, err))
@@ -162,10 +169,10 @@ func (b *bridge) authorize(p *proposal) error {
 		}
 		sigs[index] = s
 	}
-	if len(sigs) < b.signers.Required {
-		return fmt.Errorf("%d of %d signatures: %s", len(sigs), b.signers.Required, strings.Join(failures, "; "))
+	if len(sigs) < set.Required {
+		return fmt.Errorf("%d of %d signatures: %s", len(sigs), set.Required, strings.Join(failures, "; "))
 	}
-	return b.signers.assemble(p.tx, p.prev, sigs)
+	return set.assemble(p.tx, p.prev, sigs)
 }
 
 // blockHints names the block of each Bitcoin transaction p involves: the
@@ -598,6 +605,14 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 	if p := b.paused(); p != nil {
 		return nil, nil, 0, fmt.Errorf("this signer is paused: %s", p.Reason)
 	}
+	// A signer whose set was replaced only moves that set's coins to the
+	// new one; a signer of the current set never does (rotate.go).
+	if current := b.signers.indexOf(c.key.PubKey()) >= 0; current == (req.Action.Kind == actionMigrate) {
+		if current {
+			return nil, nil, 0, errors.New("moving an earlier set's coins takes that set's signers")
+		}
+		return nil, nil, 0, errors.New("this signer's set was replaced: it only moves its coins to the new set")
+	}
 	tx, err := decodeTx(req.Tx)
 	if err != nil {
 		return nil, nil, 0, err
@@ -803,6 +818,19 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 			return nil, nil, 0, err
 		}
 
+	case actionMigrate:
+		// Where every coin goes is fixed by this signer's own view, and
+		// the value moved never counts against the daily limit: it stays
+		// the peg's.
+		var moved map[wire.OutPoint]bool
+		if want, prev, moved, err = c.checkMigrate(s, req, tx, pick); err != nil {
+			return nil, nil, 0, err
+		}
+		for op := range moved {
+			unspent[op] = true
+		}
+		value = 0
+
 	default:
 		return nil, nil, 0, fmt.Errorf("unknown action %q", req.Action.Kind)
 	}
@@ -854,7 +882,7 @@ func (c *cosigner) catchUp(s *pegState, req signRequest, tx *wire.MsgTx) (*pegSt
 	}
 	if req.Chain == chainBitcoin {
 		known := map[wire.OutPoint]bool{}
-		for _, u := range s.lockedUTXOs {
+		for _, u := range append(s.lockedUTXOs, s.legacyUTXOs...) {
 			known[u.outPoint] = true
 		}
 		for _, in := range tx.TxIn {
@@ -1189,7 +1217,10 @@ func cmdSigner(args []string) error {
 		return err
 	}
 	if signers.indexOf(key.PubKey()) < 0 {
-		return errors.New("this key is not in the signer set")
+		if signers.retired(key.PubKey()) == nil {
+			return errors.New("this key is not in the signer set")
+		}
+		fmt.Fprintf(os.Stderr, "This key belongs to a set this one replaced: it signs only moves of that set's coins to the new set.\n")
 	}
 	if err := b.connect(&s, signers); err != nil {
 		return err
