@@ -61,11 +61,11 @@ func BtcdMain(c *Config) (*Server, error) {
 	// Show version at startup.
 	btcdLog.Infof("Version %s", version())
 
-	// Perform upgrades to btcd as new versions require it.
-	if err := doUpgrades(); err != nil {
-		btcdLog.Errorf("%v", err)
-		return nil, err
-	}
+	// No btcd path migrations (upgrade.go, removed): they looked for an old
+	// btcd home at $HOME/.btcd, or "." without HOME, and deleted its ./db.
+	// metalgo starts plugins with no environment, in its own working
+	// directory, so that could be metalgo's data dir and ./db its database.
+	// A VM only ever uses the dataDir and logDir it is given.
 
 	// Return now if an interrupt signal was triggered.
 	if interruptRequested(interrupt) {
