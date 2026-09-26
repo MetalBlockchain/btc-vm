@@ -1011,7 +1011,7 @@ func (l *signingLog) normalizeKeys() error {
 		}
 		a := action{Kind: kind}
 		switch kind {
-		case actionRelease, actionRefund:
+		case actionRelease, actionRefund, actionMigrate:
 			a.Deposit = value
 		case actionPayout:
 			a.PegOut = value

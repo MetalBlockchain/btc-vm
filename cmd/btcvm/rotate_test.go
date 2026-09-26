@@ -3,6 +3,7 @@ package main
 import (
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -305,4 +306,40 @@ func creditedTo(c *fakeChain, dest destination) int64 {
 		}
 	}
 	return total
+}
+
+// TestRetiredSignerRestarts: a retired signer's log holds the moves it
+// signed, and must load again when the signer restarts. (On mainnet the
+// first restart after a rotation found the log loader didn't know "migrate".)
+func TestRetiredSignerRestarts(t *testing.T) {
+	require := require.New(t)
+	h := newCosignHarness(t)
+	for _, c := range h.signers {
+		c.b.minFeeRate, c.b.maxFeeRate = 1, 50
+	}
+	h.b.minFeeRate, h.b.maxFeeRate = 1, 50
+	h.b.feeRate = func() (int64, error) { return 5, nil }
+	alice := h.user(1)
+	_, err := registerDeposit(h.b, alice)
+	require.NoError(err)
+	h.personalDeposit(10*btc, alice, 6)
+	h.deposit(1*btc, nil, 6)
+	for h.step() != "" {
+		h.vm.mine()
+	}
+	r := h.rotate(t)
+	require.Contains(h.step(), "reserve")
+	h.vm.mine()
+	require.Contains(h.step(), "Bitcoin")
+	signed := 0
+	for _, c := range r.retired {
+		reopened, err := openSigningLog(c.log.path)
+		require.NoError(err, "a retired signer's log loads after a restart")
+		for key := range reopened.Actions {
+			if strings.HasPrefix(key, actionMigrate+":") {
+				signed++
+			}
+		}
+	}
+	require.Positive(signed, "the moves are in the logs")
 }
