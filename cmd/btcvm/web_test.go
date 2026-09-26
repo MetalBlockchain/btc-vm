@@ -219,3 +219,15 @@ func TestWebAddressBook(t *testing.T) {
 	require.NoError(t, err, string(out))
 	require.Equal(t, "ok\n", string(out))
 }
+
+// TestWebPasskey runs the web wallet's passkey checks: a PIN or biometric
+// is required and checked, and backups made before still open.
+func TestWebPasskey(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	out, err := exec.Command(node, "testdata/passkey_check.mjs").CombinedOutput()
+	require.NoError(t, err, string(out))
+	require.Equal(t, "ok\n", string(out))
+}

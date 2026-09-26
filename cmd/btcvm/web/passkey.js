@@ -8,6 +8,12 @@
 // passkey, so it can be kept anywhere. With a passkey that syncs (iCloud
 // Keychain, Google Password Manager), backup plus passkey restore the wallet
 // on another device.
+//
+// Opening the wallet takes the passkey and its PIN or biometric: user
+// verification is required, and checked in the authenticator's own flags.
+// With a security key, the PRF secret differs with and without verification,
+// so a backup made before this (without it, by a key with no PIN) still
+// opens as it was made, and the wallet suggests making a new one.
 
 const PREFIX = 'btcvm-passkey:v1:';
 const INFO = new TextEncoder().encode('btcvm wallet key v1');
@@ -45,8 +51,16 @@ async function aesKey(prfOutput, salt) {
   );
 }
 
-// prfSecret asks the passkey for its PRF output for salt.
-async function prfSecret(credentialId, salt) {
+// userVerified reads the UV bit of an assertion's authenticator data.
+const userVerified = (assertion) => {
+  const data = assertion?.response?.authenticatorData;
+  return Boolean(data && data.byteLength > 32 && (new Uint8Array(data)[32] & 0x04));
+};
+
+// prfSecret asks the passkey for its PRF output for salt: with the user
+// verified (PIN or biometric), unless verify is false, for a backup made
+// before verification was required.
+async function prfSecret(credentialId, salt, verify = true) {
   let assertion;
   try {
     assertion = await navigator.credentials.get({
@@ -54,13 +68,15 @@ async function prfSecret(credentialId, salt) {
         challenge: random(32),
         rpId: location.hostname,
         allowCredentials: credentialId ? [{ type: 'public-key', id: credentialId }] : [],
-        // A PIN or biometric if the authenticator has one; a touch otherwise.
-        userVerification: 'preferred',
+        userVerification: verify ? 'required' : 'preferred',
         extensions: { prf: { eval: { first: salt } } },
       },
     });
   } catch (err) {
     throw failure(err);
+  }
+  if (verify && !userVerified(assertion)) {
+    throw new PasskeyError('The passkey did not verify you with a PIN or biometric, which the wallet requires. Set a PIN on your security key, or use a passkey that has one.');
   }
   const results = assertion?.getClientExtensionResults();
   const out = results?.prf?.results?.first;
@@ -82,7 +98,7 @@ export async function protect(key) {
         // The backup names the credential, so it need not be discoverable:
         // on a security key such as a YubiKey that saves one of its
         // limited slots. Passkey managers make it discoverable anyway.
-        authenticatorSelection: { residentKey: 'discouraged', userVerification: 'preferred' },
+        authenticatorSelection: { residentKey: 'discouraged', userVerification: 'required' },
         extensions: { prf: {} },
       },
     });
@@ -100,6 +116,7 @@ export async function protect(key) {
   secret.fill(0);
   const backup = PREFIX + b64u(new TextEncoder().encode(JSON.stringify({
     c: b64u(new Uint8Array(credential.rawId)), s: b64u(salt), i: b64u(iv), d: b64u(sealed),
+    u: 1, // made with the user verified: always opened that way
   })));
   // Check it opens before the caller drops the unencrypted key.
   const reopened = await unlock(backup);
@@ -109,17 +126,30 @@ export async function protect(key) {
   return backup;
 }
 
-// unlock decrypts a backup with its passkey.
-export async function unlock(backup) {
+function parseBackup(backup) {
   if (!isBackup(backup)) throw new PasskeyError('That is not a BTCVM passkey backup.');
-  let parts;
   try {
-    parts = JSON.parse(new TextDecoder().decode(unb64u(backup.trim().slice(PREFIX.length))));
+    return JSON.parse(new TextDecoder().decode(unb64u(backup.trim().slice(PREFIX.length))));
   } catch {
     throw new PasskeyError('That passkey backup is damaged.');
   }
+}
+
+// madeUnverified reports whether a backup was made before the wallet
+// required a PIN or biometric: it opens without one.
+export function madeUnverified(backup) {
+  try {
+    return parseBackup(backup).u !== 1;
+  } catch {
+    return false;
+  }
+}
+
+// unlock decrypts a backup with its passkey.
+export async function unlock(backup) {
+  const parts = parseBackup(backup);
   const salt = unb64u(parts.s);
-  const { secret } = await prfSecret(unb64u(parts.c), salt);
+  const { secret } = await prfSecret(unb64u(parts.c), salt, parts.u === 1);
   try {
     const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64u(parts.i) }, await aesKey(secret, salt), unb64u(parts.d));
     return new Uint8Array(plain);

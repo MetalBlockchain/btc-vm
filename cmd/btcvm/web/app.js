@@ -782,7 +782,10 @@ function renderPasskey() {
   if (section.hidden) return;
   const backup = store.get(PASSKEY_STORE);
   $('passkey-status').textContent = backup
-    ? 'Protected with a passkey: this browser keeps your key only in encrypted form. Keep the encrypted backup somewhere safe; with your passkey it restores this wallet on another device.'
+    ? 'Protected with a passkey: this browser keeps your key only in encrypted form. Keep the encrypted backup somewhere safe; with your passkey it restores this wallet on another device.' +
+      (passkey.madeUnverified(backup)
+        ? ' This backup was made before the wallet required your PIN or biometric, so it may open with a touch alone. For that protection, make a new passkey backup (restore the key into a fresh browser profile, then protect it again).'
+        : '')
     : 'Protect this wallet with a passkey. Your key is then kept encrypted, and opening the wallet takes Face ID, Touch ID or your security key.';
   $('passkey-protect').hidden = Boolean(backup);
   $('passkey-lock').hidden = !backup;
