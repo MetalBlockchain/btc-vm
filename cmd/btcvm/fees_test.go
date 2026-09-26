@@ -448,7 +448,7 @@ func TestRefundWaitsForTheBridge(t *testing.T) {
 // even when its view says the old inputs are gone (spent, so "dead").
 func TestSigningLogRefusesAfterAConfirmedSignature(t *testing.T) {
 	require := require.New(t)
-	l, err := openSigningLog(t.TempDir() + "/signing-log.json")
+	l, err := createSigningLog(t.TempDir() + "/signing-log.json")
 	require.NoError(err)
 	first := wire.NewMsgTx(3)
 	first.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 1}, nil, nil))

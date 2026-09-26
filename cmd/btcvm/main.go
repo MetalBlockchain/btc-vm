@@ -65,6 +65,9 @@ Bridge (peg signers):
   btcvm signer-setup STEP                    set up separate signers: init, coordinator, assemble, join, check
   btcvm signer-key -out FILE                 new key for one separate signer; prints its public key
   btcvm signer -signers FILE -key-file FILE  run one separate signer (see docs/SIGNERS.md)
+  btcvm signer-log check|init -signers FILE -key-file FILE
+                                             check a signer's log against the chains, or start the
+                                             log of a key that has never signed
 
 Personal deposit addresses are recorded in -deposits (default deposits.json
 next to the signers file) so the bridge knows to watch them.
@@ -151,6 +154,7 @@ func main() {
 		"monitor":         cmdMonitor,
 		"signer":          cmdSigner,
 		"signer-key":      cmdSignerKey,
+		"signer-log":      cmdSignerLog,
 		"signer-setup":    cmdSignerSetup,
 		"signers-check":   cmdSignersCheck,
 		"pause":           cmdPause,

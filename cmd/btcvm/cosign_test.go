@@ -39,7 +39,7 @@ func newCosignHarness(t *testing.T) *cosignHarness {
 		own.signers = publicOnly(t, full)
 		own.cosigners = nil
 		own.registry = &depositRegistry{path: filepath.Join(dir, "deposits.json")}
-		log, err := openSigningLog(filepath.Join(dir, "signing-log.json"))
+		log, err := createSigningLog(filepath.Join(dir, "signing-log.json"))
 		require.NoError(t, err)
 		c := &cosigner{b: &own, key: key, log: log, token: "token-" + string(rune('a'+i))}
 		srv := httptest.NewServer(c.handler())

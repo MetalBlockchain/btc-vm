@@ -450,6 +450,9 @@ type cosigner struct {
 	open bool
 
 	mu sync.Mutex // one proposal at a time
+	// mine holds chain transactions found to carry this signer's signature
+	// (fence.go).
+	mine map[chainhash.Hash]bool
 }
 
 func (c *cosigner) handler() http.Handler {
@@ -558,6 +561,7 @@ func (c *cosigner) handleStatus(*http.Request) (any, error) {
 	}
 	a := c.b.audit(s)
 	return map[string]any{
+		"quarantined": c.quarantined(),
 		"publicKey":   hex.EncodeToString(c.key.PubKey().SerializeCompressed()),
 		"solvent":     a.solvent(),
 		"locked":      formatBTC(a.Locked),
@@ -648,6 +652,9 @@ func (c *cosigner) check(req signRequest) (*wire.MsgTx, []spent, int64, error) {
 		return nil, nil, 0, err
 	}
 	if s, err = c.catchUp(s, req, tx); err != nil {
+		return nil, nil, 0, err
+	}
+	if err := c.fence(s); err != nil {
 		return nil, nil, 0, err
 	}
 	if a := b.audit(s); !a.solvent() {
@@ -958,7 +965,8 @@ func findPegOut(list []pegOut, txid chainhash.Hash) (pegOut, bool) {
 // confirm: a proposal for an action already signed must spend one of the
 // same outputs as each earlier transaction still able to confirm, so at most
 // one of them can. The log must survive restarts; losing it only weakens
-// that check to what the chains show.
+// that check to what the chains show, so a missing or stale log quarantines
+// the signer (fence.go).
 type signingLog struct {
 	path    string
 	Actions map[string]*loggedAction `json:"actions"`
@@ -975,11 +983,16 @@ type loggedTx struct {
 	Inputs []string `json:"inputs"`
 }
 
+// openSigningLog reads a signer's log. A missing log is an error, never an
+// empty one: a signer's log is made with its key (signer-setup init,
+// signer-key, or signer-log init for a key that has never signed), so a
+// missing one was lost, and signing on without it could sign an action twice.
 func openSigningLog(path string) (*signingLog, error) {
 	l := &signingLog{path: path, Actions: map[string]*loggedAction{}}
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return l, nil
+		return nil, fmt.Errorf("%w: the signing log %s is missing; restore it from a backup "+
+			"(a key that has never signed can start one with signer-log init)", errQuarantined, path)
 	}
 	if err != nil {
 		return nil, err
@@ -1089,7 +1102,24 @@ func (l *signingLog) record(key string, tx *wire.MsgTx, value int64) error {
 		entry.Inputs = append(entry.Inputs, in.PreviousOutPoint.String())
 	}
 	a.Txs = append(a.Txs, entry)
+	return l.write()
+}
 
+// createSigningLog starts an empty log for a new key; it fails if one
+// exists.
+func createSigningLog(path string) (*signingLog, error) {
+	if _, err := os.Lstat(path); err == nil {
+		return nil, fmt.Errorf("%s already exists", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	l := &signingLog{path: path, Actions: map[string]*loggedAction{}}
+	return l, l.write()
+}
+
+// write replaces the log file atomically and durably: the new file, then
+// the rename, reach the disk before it returns.
+func (l *signingLog) write() error {
 	raw, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
 		return err
@@ -1110,7 +1140,10 @@ func (l *signingLog) record(key string, tx *wire.MsgTx, value int64) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), l.path)
+	if err := os.Rename(tmp.Name(), l.path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(l.path))
 }
 
 // volumeSince is the BTC moved by actions first signed since t.
@@ -1153,7 +1186,12 @@ func cmdSignerKey(args []string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	printJSON(map[string]string{"keyFile": *out, "publicKey": hex.EncodeToString(key.PubKey().SerializeCompressed())})
+	logPath := filepath.Join(filepath.Dir(*out), "signing-log.json")
+	if _, err := createSigningLog(logPath); err != nil {
+		return fmt.Errorf("starting the signing log: %w", err)
+	}
+	printJSON(map[string]string{"keyFile": *out, "signingLog": logPath,
+		"publicKey": hex.EncodeToString(key.PubKey().SerializeCompressed())})
 	return nil
 }
 
@@ -1237,6 +1275,17 @@ func cmdSigner(args []string) error {
 		return err
 	}
 	c := &cosigner{b: b, key: key, log: log, refundApprovals: *approvals, maxDaily: *maxDaily}
+	// Before serving anything, the log must hold everything the chains show
+	// this key signed. A node still syncing can't say yet; the same check
+	// runs before every signature.
+	if reason := c.quarantined(); reason != "" {
+		return fmt.Errorf("%w: %s (restore the signing log, then remove %s)", errQuarantined, reason, quarantinePath(log.path))
+	}
+	if s0, err := b.load(); err != nil {
+		b.logf("can't check the signing log against the chains yet (%v); checking before each signature", err)
+	} else if err := c.fence(s0); err != nil {
+		return err
+	}
 	if *tokenFile != "" {
 		raw, err := os.ReadFile(*tokenFile)
 		if err != nil {

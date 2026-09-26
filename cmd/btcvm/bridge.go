@@ -132,6 +132,9 @@ type pegState struct {
 	lockedUTXOs    []utxo
 	unclaimedOnBTC int64 // deposits without a usable destination
 	unclaimedOnVM  int64 // untagged or too-small payments into the reserve
+	// vmTxs and btcTxs are the transactions read from each chain, for a
+	// signer's check of its log against them (fence.go).
+	vmTxs, btcTxs []chainTx
 }
 
 // audit is the peg's solvency check.
@@ -262,6 +265,7 @@ func (b *bridge) load() (*pegState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading BTCVM reserve: %w", err)
 	}
+	s.vmTxs = vmTxs
 	reserveOuts := map[wire.OutPoint]bool{}
 	for _, t := range vmTxs {
 		outs, _ := paidToReserve(t.tx)
@@ -362,6 +366,7 @@ func (b *bridge) load() (*pegState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading Bitcoin peg addresses: %w", err)
 	}
+	s.btcTxs = btcTxs
 	pegOuts := map[wire.OutPoint]bool{}
 	for _, t := range btcTxs {
 		hash := t.tx.TxHash()

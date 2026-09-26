@@ -348,6 +348,11 @@ func setupInit(args []string) error {
 	if err := writeNew(keyPath, []byte(hex.EncodeToString(key.Serialize())+"\n"), 0o600); err != nil {
 		return err
 	}
+	// The signing log is born with the key: from now on a missing log means
+	// a lost one, and the signer refuses to run without it.
+	if _, err := createSigningLog(filepath.Join(*dir, signingLogKey)); err != nil {
+		return err
+	}
 	card := makeCard(*name, *signerURL, key)
 	raw, _ := json.MarshalIndent(card, "", "  ")
 	cardPath := filepath.Join(*dir, cardFileName)

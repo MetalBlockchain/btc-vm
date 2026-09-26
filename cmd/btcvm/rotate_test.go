@@ -44,7 +44,7 @@ func (h *cosignHarness) rotate(t *testing.T) *rotation {
 		own.signers = next
 		own.cosigners = nil
 		own.registry = &depositRegistry{path: filepath.Join(dir, "deposits.json")}
-		log, err := openSigningLog(filepath.Join(dir, "signing-log.json"))
+		log, err := createSigningLog(filepath.Join(dir, "signing-log.json"))
 		require.NoError(t, err)
 		c := &cosigner{b: &own, key: key, log: log, token: "token-new-" + string(rune('a'+i))}
 		srv := httptest.NewServer(c.handler())

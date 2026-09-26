@@ -116,8 +116,19 @@ other signers read out. An agent can't confirm a fingerprint for itself.
   be signed by the coordinator key and be no more than 5 minutes old. The
   requests and answers carry only public data, so TLS is good practice but
   not what keeps funds safe.
-- **The signing log** (`signing-log.json`). Back it up. If it is lost, the
-  signer falls back on what the chains show.
+- **The signing log** (`signing-log.json`), made with the key by
+  `signer-setup init`. Back it up. A signer never runs on a missing log, or
+  on one older than what it has signed: at start and before every signature
+  it checks that each transaction on either chain carrying its signature is
+  in the log. If not (a backup restored after the signer had signed more, or
+  a copy of the signer), it is **quarantined**: it writes
+  `signing-log.json.quarantine`, alerts in its log, and signs nothing. To
+  recover, restore the newest log you have (the other operators can confirm
+  which transactions they signed), then delete the `.quarantine` file. A key
+  made before logs came with keys, that has never signed, starts one with
+  `btcvm signer-log init -signers FILE -key-file FILE` (it refuses if the
+  chains show the key has signed). `btcvm signer-log check` lists what a
+  log lacks without changing anything; run it before upgrading a signer.
 
 The policy is part of the signer set, so the coordinator and every signer
 use the same one. A policy flag that disagrees with it is an error.
