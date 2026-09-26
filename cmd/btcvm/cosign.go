@@ -317,8 +317,13 @@ func (s *signerSet) identifyCosigners(list []*remoteSigner) error {
 			if r.PublicKey == "" {
 				r.PublicKey = op.PublicKey
 			}
-			if r.TLSPin == "" {
+			switch {
+			case r.TLSPin == "":
 				r.TLSPin = op.TLSPin
+			case r.TLSPin != op.TLSPin:
+				// Only the card's pin is in the fingerprint the operators
+				// confirmed.
+				return fmt.Errorf("signer %s: tlsPin %s is not the pin on its card in the signer set", r.URL, r.TLSPin)
 			}
 		}
 		if r.PublicKey == "" {
