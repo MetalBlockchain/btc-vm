@@ -224,3 +224,67 @@ func TestCeremonyRefusesMistakes(t *testing.T) {
 	_, err = readKeyFile(filepath.Join(dir, keyFileName))
 	require.NoError(err)
 }
+
+// TestRotationCeremony runs signer-setup for a key rotation: three new
+// signers make fresh keys and cards, the coordinator assembles a set that
+// names the old one, the new signers join it, and the old signers join it
+// too, retired, keeping a copy of the set they ran with. A new set reusing
+// an old key is refused.
+func TestRotationCeremony(t *testing.T) {
+	require := require.New(t)
+	h := newHarness(t)
+	coordKeyPath, old, oldDirs := ceremony(t, h)
+	coord, err := readKeyFile(coordKeyPath)
+	require.NoError(err)
+	root := t.TempDir()
+	oldPath := filepath.Join(oldDirs[0], setFileName)
+
+	var cards, newDirs []string
+	for i := 0; i < 3; i++ {
+		dir := filepath.Join(root, "new"+strconv.Itoa(i))
+		answering(t, "")
+		require.NoError(setupInit([]string{"-yes", "-dir", dir, "-name", "New " + strconv.Itoa(i),
+			"-url", "https://new" + strconv.Itoa(i) + ".example:9700"}))
+		cards = append(cards, filepath.Join(dir, cardFileName))
+		newDirs = append(newDirs, dir)
+	}
+	setPath := filepath.Join(root, "signers.json")
+	cosignersPath := filepath.Join(root, "cosigners.json")
+	args := []string{"-yes", "-required", "2", "-btc-network", "regtest", "-vm-network", "testnet",
+		"-confirmations", "6", "-coordinator-key", hex.EncodeToString(coord.PubKey().SerializeCompressed()),
+		"-previous", oldPath, "-out", setPath, "-cosigners-out", cosignersPath}
+	answering(t, "")
+	require.NoError(setupAssemble(append(args, cards...)))
+	next, err := readSignerSet(setPath)
+	require.NoError(err)
+	require.Equal([]priorSet{{Required: old.Required, PublicKeys: old.PublicKeys}}, next.Previous)
+	require.NotEqual(old.fingerprint(), next.fingerprint())
+	cosigners, err := os.ReadFile(cosignersPath)
+	require.NoError(err)
+	require.Contains(string(cosigners), "new0.example", "the coordinator reaches the new signers")
+	require.Contains(string(cosigners), "signer0.example", "and the retired ones, to move the old set's coins")
+
+	for _, dir := range newDirs {
+		answering(t, "")
+		require.NoError(setupJoin([]string{"-yes", "-dir", dir, "-signers", setPath, "-fingerprint", next.fingerprint()}))
+	}
+	for _, dir := range oldDirs {
+		answering(t, "")
+		require.NoError(setupJoin([]string{"-yes", "-dir", dir, "-signers", setPath, "-fingerprint", next.fingerprint()}))
+		installed, err := readSignerSet(filepath.Join(dir, setFileName))
+		require.NoError(err)
+		require.Equal(next.fingerprint(), installed.fingerprint(), "the retired signer runs with the new set")
+		kept, err := readSignerSet(filepath.Join(dir, "signers."+old.fingerprint()+".json"))
+		require.NoError(err, "and keeps the set it ran with")
+		require.Equal(old.fingerprint(), kept.fingerprint())
+		unit, err := os.ReadFile(filepath.Join(dir, unitFileName))
+		require.NoError(err)
+		require.Contains(string(unit), "retired signer")
+	}
+
+	// Reusing an old key in the new set: refused.
+	reuse := filepath.Join(oldDirs[1], cardFileName)
+	answering(t, "")
+	err = setupAssemble(append(append([]string{}, args...), cards[0], cards[1], reuse))
+	require.ErrorContains(err, "rotation needs new keys")
+}

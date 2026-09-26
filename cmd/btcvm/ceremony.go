@@ -396,6 +396,7 @@ func setupAssemble(args []string) error {
 	coordKey := fs.String("coordinator-key", "", "the coordinator's public key (from signer-setup coordinator)")
 	out := fs.String("out", "signers.json", "file to write the signer set to")
 	cosignersOut := fs.String("cosigners-out", "cosigners.json", "file to write the coordinator's list of signers to")
+	previous := fs.String("previous", "", "for a key rotation: the signer set this one replaces (docs/ROTATION.md)")
 	yes := fs.Bool("yes", false, "no questions: take everything from flags")
 	s.register(fs)
 	b := bridgeFlags(fs)
@@ -474,6 +475,29 @@ func setupAssemble(args []string) error {
 	if seen[set.CoordinatorKey] {
 		return errors.New("the coordinator key must not be a signer key")
 	}
+	// A rotation: the new set names the one it replaces, and that set's
+	// before it, so the bridge still sees every coin they hold. Its
+	// signers keep running, retired, to move those coins here.
+	var replaces *signerSet
+	if *previous != "" {
+		if replaces, err = readSignerSet(*previous); err != nil {
+			return fmt.Errorf("-previous: %w", err)
+		}
+		set.Previous = append([]priorSet{{Required: replaces.Required, PublicKeys: replaces.PublicKeys}}, replaces.Previous...)
+		for _, prior := range set.Previous {
+			for _, k := range prior.PublicKeys {
+				if seen[k] {
+					return errors.New("a key of the new set is in a set it replaces: rotation needs new keys, made on each new signer's machine")
+				}
+			}
+		}
+		for _, op := range replaces.Operators {
+			cosigners = append(cosigners, &remoteSigner{URL: op.URL})
+		}
+		if err := set.load(); err != nil {
+			return err
+		}
+	}
 
 	vmAddr, _ := set.address(s.vmParams)
 	btcAddr, _ := set.address(s.btcParams)
@@ -484,6 +508,13 @@ func setupAssemble(args []string) error {
 		"btcvmReserve":      vmAddr.EncodeAddress(),
 		"signerSet":         *out,
 		"cosigners":         *cosignersOut,
+	}
+	if replaces != nil {
+		oldBTC, _ := replaces.address(s.btcParams)
+		summary["replaces"] = replaces.fingerprint()
+		summary["replacesPegAddress"] = oldBTC.EncodeAddress()
+		fmt.Fprintf(p.out, "This set replaces %s (peg address %s). Its signers keep running, retired, and move every coin it holds to this set.\n",
+			replaces.fingerprint(), oldBTC.EncodeAddress())
 	}
 	if ok, err := p.confirm(fmt.Sprintf("Write a %d-of-%d signer set with fingerprint %s?", set.Required, len(set.PublicKeys), set.fingerprint()), true); err != nil || !ok {
 		return errors.New("stopped; nothing was written")
@@ -498,6 +529,20 @@ func setupAssemble(args []string) error {
 	fmt.Fprintf(p.out, "Send %s to every signer, and read out the fingerprint %s to each of them over a separate channel.\n", *out, set.fingerprint())
 	printJSON(summary)
 	return nil
+}
+
+// operatorName is the name on signer me's card, or "retired signer" for a
+// key of a set this one replaced.
+func operatorName(set *signerSet, me int) string {
+	if me < 0 {
+		return "retired signer"
+	}
+	return set.Operators[me].Name
+}
+
+func mustJSON(v any) []byte {
+	raw, _ := json.MarshalIndent(v, "", "  ")
+	return append(raw, '\n')
 }
 
 func writeSetFile(path string, set *signerSet) error {
@@ -557,7 +602,8 @@ func setupJoin(args []string) error {
 		return err
 	}
 	me := set.indexOf(key.PubKey())
-	if me < 0 {
+	retired := me < 0 && set.retired(key.PubKey()) != nil
+	if me < 0 && !retired {
 		return errors.New("this signer's key is not in the set")
 	}
 
@@ -579,6 +625,14 @@ func setupJoin(args []string) error {
 		pol.Confirmations, formatBTC(pol.VMFee), pol.MinFeeRate, pol.MaxFeeRate, formatBTC(pol.MinDeposit),
 		capText(pol.MaxDeposit), capText(pol.MaxCirculating))
 	fmt.Fprintf(p.out, "Fingerprint:      %s\n\n", set.fingerprint())
+	if retired {
+		fmt.Fprintln(p.out, "This signer's key belongs to a set this one replaces. Joining makes it a retired")
+		fmt.Fprintln(p.out, "signer: it signs nothing but moves of its old set's coins to this set's addresses,")
+		fmt.Fprintln(p.out, "and it must keep running until those coins have moved (docs/ROTATION.md).")
+		fmt.Fprintln(p.out)
+	} else if len(set.Previous) > 0 {
+		fmt.Fprintf(p.out, "This set replaces %d earlier set(s); their retired signers move their coins here.\n\n", len(set.Previous))
+	}
 
 	switch {
 	case *fingerprint != "":
@@ -610,6 +664,13 @@ func setupJoin(args []string) error {
 
 	raw, _ := json.MarshalIndent(set.publicCopy(), "", "  ")
 	installed := filepath.Join(*dir, setFileName)
+	// A rotation replaces the set this signer ran with: keep a copy.
+	if old, err := readSignerSet(installed); err == nil && old.fingerprint() != set.fingerprint() {
+		kept := filepath.Join(*dir, "signers."+old.fingerprint()+".json")
+		if err := writeNew(kept, mustJSON(old.publicCopy()), 0o644); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	}
 	if err := os.WriteFile(installed, append(raw, '\n'), 0o644); err != nil {
 		return err
 	}
@@ -657,7 +718,7 @@ ReadWritePaths=%s
 
 [Install]
 WantedBy=multi-user.target
-`, set.Operators[me].Name, *user, envPath, *bin, installed, filepath.Join(*dir, keyFileName), *listen,
+`, operatorName(set, me), *user, envPath, *bin, installed, filepath.Join(*dir, keyFileName), *listen,
 		filepath.Join(*dir, signingLogKey), filepath.Join(*dir, "deposits.json"), daily, *dir)
 	unitPath := filepath.Join(*dir, unitFileName)
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
@@ -718,10 +779,13 @@ func setupCheck(args []string) error {
 		add("signer set", setErr, "")
 	}
 	if keyErr == nil && setErr == nil {
-		if set.indexOf(key.PubKey()) < 0 {
-			add("membership", errors.New("this signer's key is not in the set"), "")
-		} else {
+		switch {
+		case set.indexOf(key.PubKey()) >= 0:
 			add("membership", nil, "this signer's key is in the set")
+		case set.retired(key.PubKey()) != nil:
+			add("membership", nil, "retired: this signer's key is in a set this one replaced; it only moves that set's coins here")
+		default:
+			add("membership", errors.New("this signer's key is not in the set"), "")
 		}
 	}
 	if setErr == nil && set.Networks != nil {

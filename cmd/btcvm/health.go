@@ -60,6 +60,9 @@ func (h *healthChecker) run(state *pegState, loadErr error) []check {
 			formatBTC(a.Locked), formatBTC(a.Circulating), formatBTC(a.PendingPegIns), formatBTC(a.PendingPegOuts))
 		checks = append(checks, check{"peg", a.solvent(), detail})
 		checks = append(checks, h.bridgeLiveness(state))
+		if len(h.b.signers.prior) > 0 {
+			checks = append(checks, h.rotation(state))
+		}
 	}
 
 	checks = append(checks, h.bitcoinNode())
@@ -69,6 +72,28 @@ func (h *healthChecker) run(state *pegState, loadErr error) []check {
 		checks = append(checks, h.validatorBalance())
 	}
 	return checks
+}
+
+// rotation reports what sets this one replaced still hold, and fails if a
+// coin has waited too long to move: its retired signers may be down.
+func (h *healthChecker) rotation(s *pegState) check {
+	var btc, vm int64
+	oldest := int64(0)
+	for _, u := range s.legacyUTXOs {
+		btc += u.value
+		oldest = max(oldest, u.confirmations)
+	}
+	for _, u := range s.legacyReserve {
+		vm += u.value
+	}
+	if btc == 0 && vm == 0 {
+		return check{"rotation", true, fmt.Sprintf("the %d replaced set(s) hold nothing; their signers may retire once nothing more arrives at their addresses", len(h.b.signers.prior))}
+	}
+	detail := fmt.Sprintf("replaced sets still hold %s BTC on Bitcoin and %s BTC of reserve on BTCVM, moving to this set", formatBTC(btc), formatBTC(vm))
+	if oldest > h.stallBlocks+6 {
+		return check{"rotation", false, detail + fmt.Sprintf("; a coin has waited %d blocks: are the retired signers up, and is the surplus enough for the fee?", oldest)}
+	}
+	return check{"rotation", true, detail}
 }
 
 // pauseCheck fails while the bridge is paused, so the pause is alerted on.
