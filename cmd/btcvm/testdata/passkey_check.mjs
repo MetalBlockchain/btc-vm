@@ -61,4 +61,20 @@ auth.requests = [];
 assert.deepEqual(await passkey.unlock(old), key);
 assert.deepEqual(auth.requests, [['get', 'preferred']]);
 
+// Stripping the marker from a verified backup doesn't let it open
+// unverified: its ciphertext is bound to it. (The mock authenticator gives
+// the verified secret even without verification, the worst case.)
+const stripped = { ...JSON.parse(Buffer.from(backup.slice('btcvm-passkey:v1:'.length), 'base64url').toString()) };
+delete stripped.u;
+const strippedBackup = 'btcvm-passkey:v1:' + Buffer.from(JSON.stringify(stripped)).toString('base64url');
+auth.uv = true;
+const realGet = navigator.credentials.get;
+navigator.credentials.get = async (opts) => {
+  const a = await realGet(opts);
+  const first = prf(opts.publicKey.extensions.prf.eval.first, true);
+  return { ...a, response: { authenticatorData: authData(false) }, getClientExtensionResults: () => ({ prf: { results: { first } } }) };
+};
+await assert.rejects(passkey.unlock(strippedBackup), /doesn't open this backup/);
+navigator.credentials.get = realGet;
+
 console.log('ok');

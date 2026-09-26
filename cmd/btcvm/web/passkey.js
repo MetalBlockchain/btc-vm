@@ -17,6 +17,9 @@
 
 const PREFIX = 'btcvm-passkey:v1:';
 const INFO = new TextEncoder().encode('btcvm wallet key v1');
+// A backup made with the user verified binds that to its ciphertext, so
+// removing its marker makes it fail to open, not open without verification.
+const VERIFIED = new TextEncoder().encode('btcvm wallet key: user verified');
 
 const b64u = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
@@ -112,7 +115,7 @@ export async function protect(key) {
   const salt = random(32);
   const { secret } = await prfSecret(new Uint8Array(credential.rawId), salt);
   const iv = random(12);
-  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await aesKey(secret, salt), key));
+  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: VERIFIED }, await aesKey(secret, salt), key));
   secret.fill(0);
   const backup = PREFIX + b64u(new TextEncoder().encode(JSON.stringify({
     c: b64u(new Uint8Array(credential.rawId)), s: b64u(salt), i: b64u(iv), d: b64u(sealed),
@@ -151,7 +154,9 @@ export async function unlock(backup) {
   const salt = unb64u(parts.s);
   const { secret } = await prfSecret(unb64u(parts.c), salt, parts.u === 1);
   try {
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64u(parts.i) }, await aesKey(secret, salt), unb64u(parts.d));
+    const gcm = { name: 'AES-GCM', iv: unb64u(parts.i) };
+    if (parts.u === 1) gcm.additionalData = VERIFIED;
+    const plain = await crypto.subtle.decrypt(gcm, await aesKey(secret, salt), unb64u(parts.d));
     return new Uint8Array(plain);
   } catch {
     throw new PasskeyError("That passkey doesn't open this backup.");
