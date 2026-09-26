@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/MetalBlockchain/btcvm/btcd/chaincfg/chainhash"
 	"os"
 	"path/filepath"
 	"sort"
@@ -518,4 +519,31 @@ func TestPayoutPrefersCoinLeavingPegChange(t *testing.T) {
 	picked, err = selectForPayout([]utxo{coin(10_200, 4), exact}, 10_000)
 	require.NoError(err)
 	require.Equal(int64(10_000), picked[0].value, "no coin leaves pegDust: the smallest that covers it")
+}
+
+// TestReleaseKeepsSmallChange: a release whose inputs hold only a little
+// more than the deposit returns that little to the reserve. Left to the fee,
+// it would circulate with nothing locked behind it, the audit would find the
+// peg short, and the bridge would stop. (BTCVM has no dust limit, so change
+// of any size relays.)
+func TestReleaseKeepsSmallChange(t *testing.T) {
+	require := require.New(t)
+	h := newHarness(t)
+	alice := h.user(1)
+	h.deposit(1*btc, &alice, 6)
+	s, err := h.b.load()
+	require.NoError(err)
+	require.NotEmpty(s.deposits)
+	d := s.deposits[0]
+	for _, extra := range []int64{1, 100, pegDust - 1} {
+		in := utxo{outPoint: wire.OutPoint{Hash: chainhash.Hash{byte(extra)}}, value: d.value + extra}
+		tx := h.b.buildRelease([]utxo{in}, in.value, d)
+		var change int64
+		for _, out := range tx.TxOut {
+			if string(out.PkScript) == string(h.b.signers.pkScript()) {
+				change += out.Value
+			}
+		}
+		require.Equal(extra, change, "change of %d returns to the reserve", extra)
+	}
 }

@@ -835,9 +835,10 @@ func (b *bridge) buildRelease(inputs []utxo, total int64, d deposit) *wire.MsgTx
 		tx.AddTxIn(wire.NewTxIn(&u.outPoint, nil, nil))
 	}
 	tx.AddTxOut(wire.NewTxOut(d.value-b.vmFee, d.dest.pkScript()))
-	// Change below the dust threshold would make the release unrelayable,
-	// so it goes to the fee.
-	if change := total - d.value; change >= pegDust {
+	// Any change goes back to the reserve: BTCVM has no dust limit, and
+	// change left to the fee would circulate with nothing behind it,
+	// leaving the peg short by that much.
+	if change := total - d.value; change > 0 {
 		tx.AddTxOut(wire.NewTxOut(change, b.signers.pkScript()))
 	}
 	tx.AddTxOut(nullData(encodeRelease(d.outPoint)))
