@@ -24,8 +24,10 @@ recovering when something goes wrong.
   it joins at a small weight and is raised later.
 - **A raise needs the raised validator's signature.** A weight change that
   raises a validator is collected only with that validator's own signature
-  among the signers (the collecting node insists, whatever the client asks):
-  proof it's online and signing.
+  among the signers: proof it's online and signing. The node collecting the
+  signatures insists, whatever the client asks, but the other validators
+  don't check it when they sign, so always collect through the tool's
+  `submit` on one of the L1's validators.
 - **One change at a time.** Each validator holds the last change it signed
   (`held-change.json`, below) and signs no other until that one is on the
   P-Chain or can't be: a registration until it's registered or expires (a day
