@@ -263,13 +263,21 @@ pay() { # pay COUNT: one payment per block
     wait_for 60 "block $((h + 1))" height_above "$h"
   done
 }
+# A new validator proposes once the P-Chain height the L1 uses (which lags
+# the tip) includes it, so pay in rounds until all four have built blocks.
 FIRST=$(($(height) + 1))
-pay 40
-LAST=$(height)
 BUILT=(0 0 0 0 0 0 0) # 0: paid to nobody's address; 6: no fees
-for h in $(seq $FIRST "$LAST"); do
-  b=$(builder_of "$h")
-  BUILT[b]=$((BUILT[b] + 1))
+counted=$((FIRST - 1))
+for round in $(seq 12); do
+  pay 10
+  LAST=$(height)
+  for h in $(seq $((counted + 1)) "$LAST"); do
+    b=$(builder_of "$h")
+    BUILT[b]=$((BUILT[b] + 1))
+  done
+  counted=$LAST
+  ((BUILT[1] > 0 && BUILT[2] > 0 && BUILT[3] > 0 && BUILT[4] > 0)) && break
+  printf '    (round %d: not every validator has built yet)\n' "$round" >&2
 done
 printf '    blocks %d-%d paid to node 1: %d, 2: %d, 3: %d, 4: %d, 5: %d; empty: %d; paid elsewhere: %d\n' "$FIRST" "$LAST" \
   "${BUILT[1]}" "${BUILT[2]}" "${BUILT[3]}" "${BUILT[4]}" "${BUILT[5]}" "${BUILT[6]}" "${BUILT[0]}" >&2
