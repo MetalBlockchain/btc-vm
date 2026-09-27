@@ -8,12 +8,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/MetalBlockchain/metalgo/database/memdb"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
 	"github.com/MetalBlockchain/metalgo/snow/engine/common"
@@ -38,6 +40,7 @@ type managerFixture struct {
 	chainID  ids.ID
 	subnetID ids.ID
 	now      time.Time
+	height   uint64                                           // the P-Chain height the fixture reports
 	current  map[ids.ID]*validators.GetCurrentValidatorOutput // the L1's validators
 	deadline uint64
 }
@@ -51,12 +54,22 @@ func newKey(t *testing.T) *secp256k1.PrivateKey {
 	return k
 }
 
-// newManagerFixture: an L1 with `validators` active validators of weight 100.
+func blsKey(t *testing.T) *bls.PublicKey {
+	t.Helper()
+	sk, err := localsigner.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sk.PublicKey()
+}
+
+// newManagerFixture: an L1 with validatorCount active validators of weight
+// 100, a bootstrapped node, and no change held.
 func newManagerFixture(t *testing.T, withAdmins bool, validatorCount int) *managerFixture {
 	t.Helper()
 	f := &managerFixture{
 		outsider: newKey(t), netID: constants.LocalID, chainID: ids.GenerateTestID(), subnetID: ids.GenerateTestID(),
-		now: time.Unix(1_800_000_000, 0), current: map[ids.ID]*validators.GetCurrentValidatorOutput{},
+		now: time.Unix(1_800_000_000, 0), height: 10, current: map[ids.ID]*validators.GetCurrentValidatorOutput{},
 	}
 	f.deadline = uint64(f.now.Add(time.Hour).Unix())
 	for range validatorCount {
@@ -78,36 +91,40 @@ func newManagerFixture(t *testing.T, withAdmins bool, validatorCount int) *manag
 			if subnetID != f.subnetID {
 				t.Fatalf("read subnet %s's validators", subnetID)
 			}
-			return f.current, 10, nil
+			return f.current, f.height, nil
 		},
 	}
 	vm := &VM{ctx: &snow.Context{NetworkID: f.netID, ChainID: f.chainID, SubnetID: f.subnetID, ValidatorState: state}}
-	f.m = &validatorManager{vm: vm, policy: policy, db: memdb.New(), now: func() time.Time { return f.now }}
+	f.m = &validatorManager{vm: vm, policy: policy, lock: changeLock{path: filepath.Join(t.TempDir(), "held-change.json")}, now: func() time.Time { return f.now }}
+	f.m.ready.Store(true)
 	return f
 }
 
 // addValidator adds a validation with its own BLS key to the fixture L1.
 func (f *managerFixture) addValidator(t *testing.T, weight uint64, active bool) ids.ID {
 	t.Helper()
-	sk, err := localsigner.New()
-	if err != nil {
-		t.Fatal(err)
-	}
 	id := ids.GenerateTestID()
 	f.current[id] = &validators.GetCurrentValidatorOutput{
-		ValidationID: id, NodeID: ids.GenerateTestNodeID(), PublicKey: sk.PublicKey(),
+		ValidationID: id, NodeID: ids.GenerateTestNodeID(), PublicKey: blsKey(t),
 		Weight: weight, IsActive: active, IsL1Validator: true,
 	}
 	return id
 }
 
-// fresh forgets the change the manager signed last.
-func (f *managerFixture) fresh() { f.m.db = memdb.New() }
+// fresh forgets the change the manager holds.
+func (f *managerFixture) fresh(t *testing.T) {
+	t.Helper()
+	if err := os.Remove(f.m.lock.path); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
 
-// anyValidation is one of the fixture L1's validation IDs.
+// anyValidation is one of the fixture L1's active validation IDs.
 func (f *managerFixture) anyValidation() ids.ID {
-	for id := range f.current {
-		return id
+	for id, v := range f.current {
+		if v.IsActive {
+			return id
+		}
 	}
 	return ids.Empty
 }
@@ -126,30 +143,43 @@ func (f *managerFixture) unsigned(t *testing.T, chainID ids.ID, sourceAddress []
 	return msg
 }
 
-func (f *managerFixture) registration(t *testing.T, subnetID ids.ID, weight uint64) *message.RegisterL1Validator {
+// registrationAt is a registration for a new node, expiring an hour from now.
+func (f *managerFixture) registrationAt(t *testing.T, subnetID ids.ID, weight uint64, key *bls.PublicKey, expiry uint64) *message.RegisterL1Validator {
 	t.Helper()
 	owner := message.PChainOwner{Threshold: 1, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}
-	r, err := message.NewRegisterL1Validator(subnetID, ids.GenerateTestNodeID(), [bls.PublicKeyLen]byte{1}, 1_900_000_000, owner, owner, weight)
+	var pk [bls.PublicKeyLen]byte
+	copy(pk[:], bls.PublicKeyToCompressedBytes(key))
+	r, err := message.NewRegisterL1Validator(subnetID, ids.GenerateTestNodeID(), pk, expiry, owner, owner, weight)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r
 }
 
+func (f *managerFixture) registration(t *testing.T, subnetID ids.ID, weight uint64) *message.RegisterL1Validator {
+	t.Helper()
+	return f.registrationAt(t, subnetID, weight, blsKey(t), uint64(f.now.Add(time.Hour).Unix()))
+}
+
+// weight is a weight change at the nonce the P-Chain expects.
 func (f *managerFixture) weight(t *testing.T, validationID ids.ID, weight uint64) *message.L1ValidatorWeight {
 	t.Helper()
-	w, err := message.NewL1ValidatorWeight(validationID, 3, weight)
+	nonce := uint64(0)
+	if v, ok := f.current[validationID]; ok {
+		nonce = v.MinNonce
+	}
+	w, err := message.NewL1ValidatorWeight(validationID, nonce, weight)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return w
 }
 
-func sign(t *testing.T, msg *warp.UnsignedMessage, deadline uint64, keys ...*secp256k1.PrivateKey) [][]byte {
+func sign(t *testing.T, msg *warp.UnsignedMessage, flags byte, deadline uint64, keys ...*secp256k1.PrivateKey) [][]byte {
 	t.Helper()
 	var out [][]byte
 	for _, key := range keys {
-		sig, err := key.SignHash(ApprovalHash(msg.Bytes(), deadline))
+		sig, err := key.SignHash(ApprovalHash(msg.Bytes(), flags, deadline))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,10 +189,16 @@ func sign(t *testing.T, msg *warp.UnsignedMessage, deadline uint64, keys ...*sec
 }
 
 // approve is the justification carrying each key's approval of msg, in
-// order, with the fixture's deadline.
+// order, with the fixture's deadline and no flags.
 func (f *managerFixture) approve(t *testing.T, msg *warp.UnsignedMessage, keys ...*secp256k1.PrivateKey) []byte {
 	t.Helper()
-	return EncodeJustification(f.deadline, sign(t, msg, f.deadline, keys...))
+	return EncodeJustification(0, f.deadline, sign(t, msg, 0, f.deadline, keys...))
+}
+
+// approveReplacing approves msg to replace whatever change is held.
+func (f *managerFixture) approveReplacing(t *testing.T, msg *warp.UnsignedMessage, keys ...*secp256k1.PrivateKey) []byte {
+	t.Helper()
+	return EncodeJustification(FlagReplaceHeld, f.deadline, sign(t, msg, FlagReplaceHeld, f.deadline, keys...))
 }
 
 func (f *managerFixture) check(t *testing.T, msg *warp.UnsignedMessage, justification []byte, wantErr string) {
@@ -179,7 +215,7 @@ func (f *managerFixture) check(t *testing.T, msg *warp.UnsignedMessage, justific
 }
 
 func TestValidatorManagerVerify(t *testing.T) {
-	f := newManagerFixture(t, true, 4)
+	f := newManagerFixture(t, true, 5)
 	a, b, c := f.admins[0], f.admins[1], f.admins[2]
 	reg := f.registration(t, f.subnetID, 100)
 	good := f.unsigned(t, f.chainID, nil, reg)
@@ -199,10 +235,38 @@ func TestValidatorManagerVerify(t *testing.T) {
 	}
 	withDeadline := func(deadline uint64, keys ...*secp256k1.PrivateKey) func(*warp.UnsignedMessage) []byte {
 		return func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(deadline, sign(t, m, deadline, keys...))
+			return EncodeJustification(0, deadline, sign(t, m, 0, deadline, keys...))
 		}
 	}
 	now := uint64(f.now.Unix())
+	target := f.anyValidation()
+	f.current[target].MinNonce = 7
+	wrongNonce, err := message.NewL1ValidatorWeight(target, 8, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugeNonce, err := message.NewL1ValidatorWeight(target, math.MaxUint64, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugeRemoval, err := message.NewL1ValidatorWeight(target, math.MaxUint64, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var badKey [bls.PublicKeyLen]byte
+	badKey[0] = 1
+	owner := message.PChainOwner{Threshold: 1, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}
+	badKeyReg, err := message.NewRegisterL1Validator(f.subnetID, ids.GenerateTestNodeID(), badKey, now+3600, owner, owner, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badOwner, err := message.NewRegisterL1Validator(f.subnetID, ids.GenerateTestNodeID(), [bls.PublicKeyLen]byte{}, now+3600,
+		message.PChainOwner{Threshold: 2, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}, owner, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(badOwner.BLSPublicKey[:], bls.PublicKeyToCompressedBytes(blsKey(t)))
+	badOwnerMsg := f.unsigned(t, f.chainID, nil, badOwner)
 
 	for _, tc := range []struct {
 		name          string
@@ -212,42 +276,64 @@ func TestValidatorManagerVerify(t *testing.T) {
 	}{
 		{"registration approved by two admins", good, by(a, b), ""},
 		{"approved by all three", good, by(c, a, b), ""},
-		{"removing one of four needs all three", f.unsigned(t, f.chainID, nil, f.weight(t, f.anyValidation(), 0)), by(b, c), "needs all 3 admins"},
+		{"removal of one of five by two", f.unsigned(t, f.chainID, nil, f.weight(t, target, 0)), by(b, c), ""},
 		{"no approval", good, func(*warp.UnsignedMessage) []byte { return nil }, "no admin approvals"},
-		{"a header and no approvals", good, func(*warp.UnsignedMessage) []byte { return EncodeJustification(f.deadline, nil) }, "no whole admin approvals"},
+		{"a header and no approvals", good, func(*warp.UnsignedMessage) []byte { return EncodeJustification(0, f.deadline, nil) }, "no whole admin approvals"},
 		{"one admin alone", good, by(a), "approved by 1 of this L1's admins; it needs 2"},
 		{"one admin twice", good, by(a, a), "repeats admin"},
 		{"an admin and an outsider", good, by(a, f.outsider), "not one of this L1's validatorAdmins"},
 		{"more approvals than admins", good, by(a, b, c, a), "only 3 admins"},
 		{"a partial approval", good, func(m *warp.UnsignedMessage) []byte { return f.approve(t, m, a, b)[:100] }, "each is a 65-byte signature"},
-		{"another format", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b); j[0] = 2; return j }, "approval format 2"},
+		{"another format", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b); j[0] = 1; return j }, "approval format 1"},
+		{"an unknown flag", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b); j[1] = 0x80; return j }, "flags"},
+		{"a flag changed after signing", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b, c); j[1] = FlagReplaceHeld; return j }, "not one of this L1's validatorAdmins"},
+		{"replacing held changes with two admins", good, func(m *warp.UnsignedMessage) []byte { return f.approveReplacing(t, m, a, b) }, "only every admin together"},
 		{"expired", good, withDeadline(now-1, a, b), "expired"},
 		{"deadline too far ahead", good, withDeadline(uint64(f.now.Add(MaxApprovalLife+time.Minute).Unix()), a, b), "more than"},
 		{"deadline changed after signing", good, func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(f.deadline+60, sign(t, m, f.deadline, a, b))
+			return EncodeJustification(0, f.deadline+60, sign(t, m, 0, f.deadline, a, b))
 		}, "not one of this L1's validatorAdmins"},
 		{"admin signed the bare hash, not the approval", good, func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(f.deadline, append(sign(t, m, f.deadline, b), undomained))
+			return EncodeJustification(0, f.deadline, append(sign(t, m, 0, f.deadline, b), undomained))
 		}, "not one of this L1's validatorAdmins"},
 		{"second approval is of a different message", good, func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(f.deadline, append(sign(t, m, f.deadline, a), sign(t, other, f.deadline, b)...))
+			return EncodeJustification(0, f.deadline, append(sign(t, m, 0, f.deadline, a), sign(t, other, 0, f.deadline, b)...))
 		}, "not one of this L1's validatorAdmins"},
+		{"a registration already expired", f.unsigned(t, f.chainID, nil, f.registrationAt(t, f.subnetID, 100, blsKey(t), now)), by(a, b), "expire within the next"},
+		{"a registration expiring in over a day", f.unsigned(t, f.chainID, nil, f.registrationAt(t, f.subnetID, 100, blsKey(t), now+86401)), by(a, b), "expire within the next"},
+		{"a registration expiring past MaxInt64", f.unsigned(t, f.chainID, nil, f.registrationAt(t, f.subnetID, 100, blsKey(t), math.MaxUint64)), by(a, b), "expire within the next"},
+		{"a BLS key that doesn't parse", f.unsigned(t, f.chainID, nil, badKeyReg), by(a, b), "BLS key doesn't parse"},
+		{"an owner the P-Chain would refuse", badOwnerMsg, by(a, b), "invalid registration"},
+		{"a weight change at the wrong nonce", f.unsigned(t, f.chainID, nil, wrongNonce), by(a, b, c), "the P-Chain expects 7"},
+		{"a weight change at nonce MaxUint64", f.unsigned(t, f.chainID, nil, hugeNonce), by(a, b, c), "invalid weight change"},
+		{"a removal at nonce MaxUint64 (it would hold every signer for good)", f.unsigned(t, f.chainID, nil, hugeRemoval), by(a, b, c), "the P-Chain expects 7"},
 		{"another L1's subnet", f.unsigned(t, f.chainID, nil, f.registration(t, ids.GenerateTestID(), 100)), by(a, b), "registration is for subnet"},
-		{"weight 0 registration", f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 0)), by(a, b), "weight above 0"},
+		{"weight 0 registration", f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 0)), by(a, b), "weight"},
 		{"non-empty source address", f.unsigned(t, f.chainID, []byte{1, 2, 3}, reg), by(a, b), "source address must be empty"},
 		{"from another chain", f.unsigned(t, ids.GenerateTestID(), nil, reg), by(a, b), "not this chain"},
 		{"another kind of message", f.unsigned(t, f.chainID, nil, conversion), by(a, b), "registrations and weight changes only"},
 		{"weight change for another L1's validator", f.unsigned(t, f.chainID, nil, f.weight(t, ids.GenerateTestID(), 50)), by(a, b, c), "not one of this L1's validators"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f.fresh()
+			f.fresh(t)
 			f.check(t, tc.msg, tc.justification(tc.msg), tc.wantErr)
 		})
 	}
 }
 
-// A change that leaves one validator with a third or more of the weight
-// needs every admin; the last validator can't be removed.
+func TestValidatorManagerWaitsForBootstrap(t *testing.T) {
+	f := newManagerFixture(t, true, 5)
+	f.m.ready.Store(false)
+	msg := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, msg, f.approve(t, msg, f.admins...), "still bootstrapping")
+	if _, err := os.Stat(f.m.lock.path); !os.IsNotExist(err) {
+		t.Fatal("held a change it didn't sign")
+	}
+}
+
+// A change after which any one validator could block the P-Chain's quorum
+// needs every admin; one leaving the validators able to sign under 67% is
+// refused outright (a newcomer can't sign until it's active).
 func TestValidatorManagerWeightShares(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -255,21 +341,23 @@ func TestValidatorManagerWeightShares(t *testing.T) {
 		change     func(f *managerFixture) message.Payload
 		two, all   string // refusal with two admins, with all three ("" = signs)
 	}{
-		{"second validator (50%)", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "needs all 3 admins", ""},
-		{"fourth validator (25%)", 3, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "", ""},
-		{"a heavy fifth (weight 400 of 800)", 4, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 400) }, "able to sign hold 50.0%", ""},
+		{"second validator at 100 (only 100 of 200 could sign)", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "at most 49", "at most 49"},
+		{"second validator at 49 (the first still blocks alone)", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 49) }, "needs all 3 admins", ""},
+		{"second validator at 50", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 50) }, "at most 49", "at most 49"},
+		{"fourth validator (300 of 400 can sign, 25% each)", 3, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "", ""},
+		{"a heavy fifth (weight 400 of 800)", 4, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 400) }, "able to sign hold 50.0%", "able to sign hold 50.0%"},
 		// The P-Chain's quorum, exactly: 400 of 597 is 67.0%, of 598 isn't.
-		{"a fifth at 197 of 597 (the rest still make 67%)", 4, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 197) }, "", ""},
-		{"a fifth at 198 of 598 (the rest don't)", 4, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 198) }, "needs all 3 admins", ""},
+		{"raising one of five to 197 (the rest still make 67%)", 5, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 197) }, "", ""},
+		{"raising one of five to 198 (the rest don't)", 5, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 198) }, "needs all 3 admins", ""},
 		{"removing one of five (25% each after)", 5, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 0) }, "", ""},
 		{"removing one of four (33.3% each after)", 4, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 0) }, "needs all 3 admins", ""},
 		{"removing the last", 1, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 0) }, "no active validator", "no active validator"},
-		{"raising one of five to 300 (300 of 700)", 5, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 300) }, "needs all 3 admins", ""},
 		{"a node that already validates", 4, func(f *managerFixture) message.Payload {
-			r := f.registration(t, f.subnetID, 100)
 			node := f.current[f.anyValidation()].NodeID
 			owner := message.PChainOwner{Threshold: 1, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}
-			r, err := message.NewRegisterL1Validator(f.subnetID, node, [bls.PublicKeyLen]byte{1}, r.Expiry, owner, owner, 100)
+			var pk [bls.PublicKeyLen]byte
+			copy(pk[:], bls.PublicKeyToCompressedBytes(blsKey(t)))
+			r, err := message.NewRegisterL1Validator(f.subnetID, node, pk, uint64(f.now.Add(time.Hour).Unix()), owner, owner, 100)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -280,7 +368,7 @@ func TestValidatorManagerWeightShares(t *testing.T) {
 			f := newManagerFixture(t, true, tc.validators)
 			msg := f.unsigned(t, f.chainID, nil, tc.change(f))
 			f.check(t, msg, f.approve(t, msg, f.admins[0], f.admins[1]), tc.two)
-			f.fresh()
+			f.fresh(t)
 			f.check(t, msg, f.approve(t, msg, f.admins...), tc.all)
 		})
 	}
@@ -290,41 +378,37 @@ func TestValidatorManagerWeightShares(t *testing.T) {
 // can't sign: a change must leave the active ones at 67% of it.
 func TestValidatorManagerInactiveWeight(t *testing.T) {
 	two := func(f *managerFixture) []*secp256k1.PrivateKey { return f.admins[:2] }
+	all := func(f *managerFixture) []*secp256k1.PrivateKey { return f.admins }
+	var active func(f *managerFixture) ids.ID = func(f *managerFixture) ids.ID { return f.anyValidation() }
 	for _, tc := range []struct {
 		name    string
 		setup   func(f *managerFixture) message.Payload
-		wantErr string
 		admins  func(f *managerFixture) []*secp256k1.PrivateKey
+		wantErr string
 	}{
 		{"a fifth into four active and one inactive (400 of 600 can sign)", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
 			return f.registration(t, f.subnetID, 100)
-		}, "able to sign hold 66.7%", two},
-		{"...unless every admin counts on the newcomer", func(f *managerFixture) message.Payload {
+		}, all, "able to sign hold 66.7%"},
+		{"...at a weight the active ones outweigh", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
-			return f.registration(t, f.subnetID, 100)
-		}, "", func(f *managerFixture) []*secp256k1.PrivateKey { return f.admins }},
+			return f.registration(t, f.subnetID, 97) // 400*100 >= 597*67
+		}, two, ""},
 		{"raising an inactive validator's weight", func(f *managerFixture) message.Payload {
 			return f.weight(t, f.addValidator(t, 100, false), 300)
-		}, "able to sign hold", func(f *managerFixture) []*secp256k1.PrivateKey { return f.admins }},
+		}, all, "able to sign hold"},
 		{"removing an inactive validator from a stuck set", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
 			return f.weight(t, f.addValidator(t, 100, false), 0) // 400 of 600 -> 400 of 500
-		}, "", two},
+		}, two, ""},
 		{"removing an active one while inactive weight is high", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
-			var active ids.ID
-			for id, v := range f.current {
-				if v.IsActive {
-					active = id
-				}
-			}
-			return f.weight(t, active, 0) // 300 of 400 active... of 400 total with the inactive: 75%
-		}, "", two},
+			return f.weight(t, active(f), 0) // 300 of 400
+		}, two, ""},
 		{"a heavy inactive validator counts (a top-up could reactivate it)", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 250, false)
 			return f.registration(t, f.subnetID, 10)
-		}, "able to sign hold", two},
+		}, all, "able to sign hold"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newManagerFixture(t, true, 4)
@@ -338,14 +422,7 @@ func TestValidatorManagerInactiveWeight(t *testing.T) {
 func TestValidatorManagerRefusesReusedBLSKey(t *testing.T) {
 	f := newManagerFixture(t, true, 5)
 	existing := f.current[f.anyValidation()]
-	owner := message.PChainOwner{Threshold: 1, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}
-	var key [bls.PublicKeyLen]byte
-	copy(key[:], bls.PublicKeyToCompressedBytes(existing.PublicKey))
-	reg, err := message.NewRegisterL1Validator(f.subnetID, ids.GenerateTestNodeID(), key, 1_900_000_000, owner, owner, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := f.unsigned(t, f.chainID, nil, reg)
+	msg := f.unsigned(t, f.chainID, nil, f.registrationAt(t, f.subnetID, 1, existing.PublicKey, uint64(f.now.Add(time.Hour).Unix())))
 	f.check(t, msg, f.approve(t, msg, f.admins...), "BLS key is already registered")
 }
 
@@ -353,53 +430,105 @@ func TestValidatorManagerRefusesReusedBLSKey(t *testing.T) {
 // be gathered and submitted together.
 func TestValidatorManagerOneChangeAtATime(t *testing.T) {
 	f := newManagerFixture(t, true, 6)
+	two := []*secp256k1.PrivateKey{f.admins[0], f.admins[1]}
 	regA := f.registration(t, f.subnetID, 100)
 	a := f.unsigned(t, f.chainID, nil, regA)
 	b := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
-	f.check(t, a, f.approve(t, a, f.admins[0], f.admins[1]), "")
-	f.check(t, b, f.approve(t, b, f.admins[0], f.admins[1]), "isn't on the P-Chain yet")
+	f.check(t, a, f.approve(t, a, two...), "")
+	f.check(t, b, f.approve(t, b, two...), "isn't on the P-Chain yet")
 	f.check(t, a, f.approve(t, a, f.admins[1], f.admins[2]), "") // the same change again
 
-	// Survives a restart: a new manager on the same database.
-	f.m = &validatorManager{vm: f.m.vm, policy: f.m.policy, db: f.m.db, now: f.m.now}
-	f.check(t, b, f.approve(t, b, f.admins[0], f.admins[1]), "isn't on the P-Chain yet")
+	// Held on disk: a new manager on the same data directory still holds it.
+	restarted := &validatorManager{vm: f.m.vm, policy: f.m.policy, lock: f.m.lock, now: f.m.now}
+	restarted.ready.Store(true)
+	f.m = restarted
+	f.check(t, b, f.approve(t, b, two...), "isn't on the P-Chain yet")
+
+	// A view of the P-Chain older than the held change proves nothing.
+	f.height = 9
+	f.check(t, b, f.approve(t, b, two...), "older than the change it holds")
+	f.height = 10
 
 	// Once A is on the P-Chain, B can go.
 	nodeA, _ := ids.ToNodeID(regA.NodeID)
-	f.current[regA.ValidationID()] = &validators.GetCurrentValidatorOutput{ValidationID: regA.ValidationID(), NodeID: nodeA, Weight: 100, IsL1Validator: true, IsActive: true}
-	f.check(t, b, f.approve(t, b, f.admins[0], f.admins[1]), "")
+	f.current[regA.ValidationID()] = &validators.GetCurrentValidatorOutput{ValidationID: regA.ValidationID(), NodeID: nodeA, PublicKey: blsKey(t), Weight: 100, IsL1Validator: true, IsActive: true}
+	f.height = 11
+	f.check(t, b, f.approve(t, b, two...), "")
 
-	// A registration that expired no longer holds anything up.
-	f.fresh()
-	c := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
-	f.check(t, c, f.approve(t, c, f.admins[0], f.admins[1]), "")
-	f.check(t, b, f.approve(t, b, f.admins[0], f.admins[1]), "isn't on the P-Chain yet")
-	f.now = time.Unix(1_900_000_000, 0).Add(expirySlack + time.Second) // past the fixture's expiry
+	// A registration past its expiry no longer holds anything up.
+	f.fresh(t)
+	regC := f.registration(t, f.subnetID, 100)
+	cMsg := f.unsigned(t, f.chainID, nil, regC)
+	f.check(t, cMsg, f.approve(t, cMsg, two...), "")
+	d := f.unsigned(t, f.chainID, nil, f.weight(t, f.anyValidation(), 90))
+	f.check(t, d, f.approve(t, d, two...), "isn't on the P-Chain yet")
+	f.now = time.Unix(int64(regC.Expiry), 0).Add(expirySlack + time.Second)
 	f.deadline = uint64(f.now.Add(time.Hour).Unix())
-	f.check(t, b, f.approve(t, b, f.admins[0], f.admins[1]), "")
+	f.check(t, d, f.approve(t, d, two...), "")
 
 	// A weight change holds until the P-Chain's nonce passes it; one at the
-	// same nonce may replace it, one at another nonce may not.
-	f.fresh()
+	// same nonce may replace it.
+	f.fresh(t)
 	target := f.anyValidation()
 	f.current[target].MinNonce = 3
-	w1 := f.unsigned(t, f.chainID, nil, f.weight(t, target, 150)) // nonce 3
-	f.check(t, w1, f.approve(t, w1, f.admins[0], f.admins[1]), "")
-	replaced, err := message.NewL1ValidatorWeight(target, 3, 120)
-	if err != nil {
+	w1 := f.unsigned(t, f.chainID, nil, f.weight(t, target, 150))
+	f.check(t, w1, f.approve(t, w1, two...), "")
+	w2 := f.unsigned(t, f.chainID, nil, f.weight(t, target, 120)) // same nonce 3
+	f.check(t, w2, f.approve(t, w2, two...), "")
+	other := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, other, f.approve(t, other, two...), "isn't on the P-Chain yet")
+	f.current[target].MinNonce, f.current[target].Weight = 4, 120 // w2 applied
+	f.height = 12
+	f.check(t, other, f.approve(t, other, two...), "")
+
+	// A removal is released once the validation is gone from a view at
+	// least as new.
+	f.fresh(t)
+	gone := f.anyValidation()
+	rm := f.unsigned(t, f.chainID, nil, f.weight(t, gone, 0))
+	f.check(t, rm, f.approve(t, rm, two...), "")
+	next := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, next, f.approve(t, next, two...), "isn't on the P-Chain yet")
+	delete(f.current, gone)
+	f.height = 13
+	f.check(t, next, f.approve(t, next, two...), "")
+}
+
+// Validators holding different changes (so neither reaches 67%) can be
+// freed by every admin together, never by fewer.
+func TestValidatorManagerReplaceHeld(t *testing.T) {
+	f := newManagerFixture(t, true, 6)
+	a := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, a, f.approve(t, a, f.admins[0], f.admins[1]), "")
+	c := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, c, f.approve(t, c, f.admins...), "isn't on the P-Chain yet") // unanimity alone isn't enough
+	f.check(t, c, f.approveReplacing(t, c, f.admins[0], f.admins[1]), "only every admin together")
+	f.check(t, c, f.approveReplacing(t, c, f.admins...), "")
+	held, err := f.m.lock.read()
+	if err != nil || held == nil || !bytes.Equal(held.Message, c.Bytes()) {
+		t.Fatalf("held %v, %v; want the replacing change", held, err)
+	}
+}
+
+func TestChangeLockIsDurableAndStrict(t *testing.T) {
+	dir := t.TempDir()
+	l := changeLock{path: filepath.Join(dir, "sub", "held-change.json")}
+	if h, err := l.read(); h != nil || err != nil {
+		t.Fatalf("empty lock read %v, %v", h, err)
+	}
+	if err := l.write(heldChange{Message: []byte{1, 2, 3}, Height: 42}); err != nil {
 		t.Fatal(err)
 	}
-	w2 := f.unsigned(t, f.chainID, nil, replaced)
-	f.check(t, w2, f.approve(t, w2, f.admins[0], f.admins[1]), "")
-	later, err := message.NewL1ValidatorWeight(target, 4, 110)
-	if err != nil {
+	h, err := l.read()
+	if err != nil || h.Height != 42 || !bytes.Equal(h.Message, []byte{1, 2, 3}) {
+		t.Fatalf("read back %+v, %v", h, err)
+	}
+	if err := os.WriteFile(l.path, []byte("{broken"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	w3 := f.unsigned(t, f.chainID, nil, later)
-	f.check(t, w3, f.approve(t, w3, f.admins[0], f.admins[1]), "isn't on the P-Chain yet")
-	f.current[target].MinNonce = 4 // w2 applied
-	f.current[target].Weight = 120
-	f.check(t, w3, f.approve(t, w3, f.admins[0], f.admins[1]), "")
+	if _, err := l.read(); err == nil {
+		t.Fatal("a corrupt lock read as empty")
+	}
 }
 
 type countingHandler struct{ calls int }
@@ -410,11 +539,13 @@ func (h *countingHandler) AppRequest(context.Context, ids.NodeID, time.Time, []b
 	return nil, nil
 }
 
-// Each peer has its own budget, so one can't starve the others.
+// Each peer has its own budget; non-validators share a global one too, so
+// they can't starve the validators.
 func TestLimitedHandler(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	inner := &countingHandler{}
-	h := newLimitedHandler(inner, func() time.Time { return now })
+	validator := ids.GenerateTestNodeID()
+	h := newLimitedHandler(inner, func() time.Time { return now }, func(_ context.Context, n ids.NodeID) bool { return n == validator })
 	noisy, quiet := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
 	refused := 0
 	for range 50 {
@@ -428,9 +559,28 @@ func TestLimitedHandler(t *testing.T) {
 	if _, err := h.AppRequest(context.Background(), quiet, now, nil); err != nil {
 		t.Fatalf("a quiet peer was refused: %s", err.Message)
 	}
-	now = now.Add(time.Second)
-	if _, err := h.AppRequest(context.Background(), noisy, now, nil); err != nil {
-		t.Fatalf("the noisy peer's budget didn't refill: %s", err.Message)
+	// Many strangers drain the global budget; a validator still gets through.
+	for range globalBurst + 50 {
+		_, _ = h.AppRequest(context.Background(), ids.GenerateTestNodeID(), now, nil)
+	}
+	if _, err := h.AppRequest(context.Background(), ids.GenerateTestNodeID(), now, nil); err == nil {
+		t.Fatal("a stranger got through with the global budget spent")
+	}
+	if _, err := h.AppRequest(context.Background(), validator, now, nil); err != nil {
+		t.Fatalf("a validator was starved: %s", err.Message)
+	}
+	// With the peer table full, new strangers are turned away; the table
+	// isn't reset (known peers keep their spent budgets).
+	h.peers = map[ids.NodeID]*rateLimiter{noisy: h.peers[noisy]}
+	for len(h.peers) < maxPeers {
+		h.peers[ids.GenerateTestNodeID()] = newRateLimiter(peerRate, peerBurst)
+	}
+	now = now.Add(time.Hour)
+	if _, err := h.AppRequest(context.Background(), ids.GenerateTestNodeID(), now, nil); err == nil {
+		t.Fatal("a new stranger was admitted to a full table")
+	}
+	if _, ok := h.peers[noisy]; !ok {
+		t.Fatal("the peer table was reset")
 	}
 }
 
@@ -444,14 +594,33 @@ func TestValidatorManagerWithoutAdminsSignsNothing(t *testing.T) {
 // these bytes must not change.
 func TestApprovalHashVector(t *testing.T) {
 	msg := []byte("unsigned warp message bytes")
-	got := hex.EncodeToString(ApprovalHash(msg, 1_800_000_000))
-	const want = "afefcb8bc9f1797ea50a59c04795f36ea691fe95586b6c4f3b242e8c608523b6"
-	if got != want {
-		t.Fatalf("ApprovalHash vector = %s; want %s", got, want)
+	for flags, want := range map[byte]string{
+		0:               "59998b8f90c7e6f69494641cdbdde700b472bb2c4aa0d2eb99432edce65e1d3a",
+		FlagReplaceHeld: "0349859280fb5e42ea168747d2696fd06da51db291ae08e2fea4e9ea84d897f5",
+	} {
+		if got := hex.EncodeToString(ApprovalHash(msg, flags, 1_800_000_000)); got != want {
+			t.Fatalf("ApprovalHash vector (flags %d) = %s; want %s", flags, got, want)
+		}
 	}
-	j := EncodeJustification(1_800_000_000, [][]byte{bytes.Repeat([]byte{7}, 65)})
-	if hex.EncodeToString(j[:9]) != "01000000006b49d200" || len(j) != 9+65 {
-		t.Fatalf("justification header %x", j[:9])
+	j := EncodeJustification(FlagReplaceHeld, 1_800_000_000, [][]byte{bytes.Repeat([]byte{7}, 65)})
+	if hex.EncodeToString(j[:10]) != "0201000000006b49d200" || len(j) != 10+65 {
+		t.Fatalf("justification header %x", j[:10])
+	}
+}
+
+func TestMaxNewcomerWeight(t *testing.T) {
+	for _, tc := range []struct{ signable, total, want int64 }{
+		{100, 100, 49}, {200, 200, 98}, {300, 300, 147}, {400, 500, 97}, {60, 100, 0},
+	} {
+		got := MaxNewcomerWeight(big.NewInt(tc.signable), big.NewInt(tc.total))
+		if got.Int64() != tc.want {
+			t.Fatalf("MaxNewcomerWeight(%d, %d) = %s; want %d", tc.signable, tc.total, got, tc.want)
+		}
+		// And it's exact: one more wouldn't make 67%.
+		w := new(big.Int).Add(got, big.NewInt(1))
+		if quorumOf(big.NewInt(tc.signable), new(big.Int).Add(big.NewInt(tc.total), w)) {
+			t.Fatalf("%d, %d: %s more would still make 67%%", tc.signable, tc.total, w)
+		}
 	}
 }
 

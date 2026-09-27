@@ -6,9 +6,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	log "github.com/inconshreveable/log15"
+
+	"github.com/MetalBlockchain/btcvm/vm"
 )
 
 // config defines the configuration options for btcvm
@@ -122,4 +125,25 @@ func (c *config) show() {
 		"memProfile", c.MemProfile,
 		"httpProfile", c.HTTPProfile,
 	)
+}
+
+// checkChainConfig parses a chain config's validator settings exactly as
+// the VM will, for installers: 0 if the VM would start with it.
+func checkChainConfig(path string) int {
+	var raw []byte
+	var err error
+	if path == "-" {
+		raw, err = io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+	} else {
+		raw, err = os.ReadFile(path)
+	}
+	if err == nil {
+		err = vm.CheckChainConfig(raw)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "chain config:", err)
+		return 1
+	}
+	fmt.Println("ok")
+	return 0
 }

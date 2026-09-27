@@ -13,13 +13,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/MetalBlockchain/metalgo/database"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/network/p2p"
 	"github.com/MetalBlockchain/metalgo/network/p2p/acp118"
@@ -54,20 +55,26 @@ import (
 // admin key can change the validator set alone, and approvals expire.
 //
 // A change is also checked against the L1's current validators (see
-// checkChange): a weight change must be for one of them; a registration
-// can't reuse a registered BLS key; the validators able to sign must still
-// reach the P-Chain's 67% of the whole registered weight afterwards (only a
-// registration approved by every admin may count on the newcomer); and a
-// change after which any one BLS key could block that quorum alone needs
-// every admin.
+// checkChange): a weight change must be for one of them, at the nonce the
+// P-Chain expects next; a registration expires within a day and can't reuse
+// a registered BLS key; the validators able to sign now must still make the
+// P-Chain's 67% of the whole registered weight afterwards (a newcomer can't
+// sign until it's funded and online, so an L1 grows by adding a validator
+// at a small weight and raising it once it's active); and a change after
+// which any one BLS key could block that quorum alone needs every admin.
 //
 // Changes don't add up behind the policy's back: a node signs one change at
-// a time. Until the change it last signed is on the P-Chain or can no
+// a time (changeLock). Until the change it holds is on the P-Chain or can no
 // longer be (a registration past its expiry, a weight change whose nonce
 // the P-Chain has moved past), it signs only that same change again, or a
 // weight change replacing it at the same nonce (only one of the two can
 // ever apply). Any 67% of the weight asked to sign a second change includes
 // validators still holding the first, so the second never gathers enough.
+// Holding is judged only on a P-Chain view at least as new as the held
+// change's. If validators end up holding different changes (so neither can
+// reach 67%), every admin together can approve a change flagged to replace
+// whatever they hold (FlagReplaceHeld): every admin can already make any
+// change, so this adds no power, only a way out.
 //
 // Signing is node policy, not consensus: blocks and their validity are
 // unchanged, and a node with no admins configured signs nothing.
@@ -82,24 +89,38 @@ const aggregateTimeout = 30 * time.Second
 
 // ApprovalVersion is the format of an approval and of the justification
 // that carries approvals.
-const ApprovalVersion byte = 1
+const ApprovalVersion byte = 2
+
+// Approval flags: part of what every admin signs.
+const (
+	// FlagReplaceHeld: the change replaces whatever change a validator
+	// holds (see the package comment). Only with every admin's approval.
+	FlagReplaceHeld byte = 1 << 0
+
+	knownFlags = FlagReplaceHeld
+)
 
 // MaxApprovalLife bounds how far ahead an approval's deadline can be: long
 // enough for admins to sign in turn, short enough that a forgotten
 // approval dies.
 const MaxApprovalLife = 7 * 24 * time.Hour
 
-// justificationHeader is the version byte and the 8-byte deadline.
-const justificationHeader = 1 + 8
+// MaxRegistrationLife is the P-Chain's limit on how far ahead a
+// registration's expiry can be.
+const MaxRegistrationLife = 24 * time.Hour
+
+// justificationHeader is the version byte, the flags byte and the 8-byte
+// deadline.
+const justificationHeader = 1 + 1 + 8
 
 // ApprovalHash is what every admin signs to approve an unsigned Warp message
-// until deadline (Unix seconds):
+// with the given flags until deadline (Unix seconds):
 //
-//	sha256(ApprovalDomain || ApprovalVersion || deadline, 8 bytes big-endian || unsigned message)
-func ApprovalHash(unsignedMessage []byte, deadline uint64) []byte {
+//	sha256(ApprovalDomain || ApprovalVersion || flags || deadline, 8 bytes big-endian || unsigned message)
+func ApprovalHash(unsignedMessage []byte, flags byte, deadline uint64) []byte {
 	h := sha256.New()
 	h.Write([]byte(ApprovalDomain))
-	h.Write([]byte{ApprovalVersion})
+	h.Write([]byte{ApprovalVersion, flags})
 	var d [8]byte
 	binary.BigEndian.PutUint64(d[:], deadline)
 	h.Write(d[:])
@@ -108,37 +129,41 @@ func ApprovalHash(unsignedMessage []byte, deadline uint64) []byte {
 }
 
 // EncodeJustification is the ACP-118 justification for approvals of one
-// message, all with the same deadline:
+// message, all with the same flags and deadline:
 //
-//	ApprovalVersion || deadline, 8 bytes big-endian || approval (65 bytes) ...
-func EncodeJustification(deadline uint64, approvals [][]byte) []byte {
+//	ApprovalVersion || flags || deadline, 8 bytes big-endian || approval (65 bytes) ...
+func EncodeJustification(flags byte, deadline uint64, approvals [][]byte) []byte {
 	out := make([]byte, justificationHeader, justificationHeader+len(approvals)*secp256k1.SignatureLen)
-	out[0] = ApprovalVersion
-	binary.BigEndian.PutUint64(out[1:], deadline)
+	out[0], out[1] = ApprovalVersion, flags
+	binary.BigEndian.PutUint64(out[2:], deadline)
 	for _, a := range approvals {
 		out = append(out, a...)
 	}
 	return out
 }
 
-func decodeJustification(b []byte) (uint64, [][]byte, error) {
+func decodeJustification(b []byte) (byte, uint64, [][]byte, error) {
 	if len(b) < justificationHeader {
-		return 0, nil, errors.New("the change carries no admin approvals")
+		return 0, 0, nil, errors.New("the change carries no admin approvals")
 	}
 	if b[0] != ApprovalVersion {
-		return 0, nil, fmt.Errorf("approval format %d; this node reads format %d", b[0], ApprovalVersion)
+		return 0, 0, nil, fmt.Errorf("approval format %d; this node reads format %d", b[0], ApprovalVersion)
 	}
-	deadline := binary.BigEndian.Uint64(b[1:justificationHeader])
+	flags := b[1]
+	if flags&^knownFlags != 0 {
+		return 0, 0, nil, fmt.Errorf("approval flags %#x include ones this node doesn't know", flags)
+	}
+	deadline := binary.BigEndian.Uint64(b[2:justificationHeader])
 	rest := b[justificationHeader:]
 	if len(rest) == 0 || len(rest)%secp256k1.SignatureLen != 0 {
-		return 0, nil, errors.New("the change carries no whole admin approvals (each is a 65-byte signature)")
+		return 0, 0, nil, errors.New("the change carries no whole admin approvals (each is a 65-byte signature)")
 	}
 	var sigs [][]byte
 	for len(rest) > 0 {
 		sigs = append(sigs, rest[:secp256k1.SignatureLen])
 		rest = rest[secp256k1.SignatureLen:]
 	}
-	return deadline, sigs, nil
+	return flags, deadline, sigs, nil
 }
 
 // validatorAdminsConfig is the part of the chain config the manager reads.
@@ -155,6 +180,13 @@ type adminPolicy struct {
 
 // majority is the default threshold: more than half of n admins.
 func majority(n int) int { return n/2 + 1 }
+
+// CheckChainConfig reports whether the VM would accept a chain config's
+// validator settings (for installers, via the plugin's -check-config).
+func CheckChainConfig(configBytes []byte) error {
+	_, err := parseValidatorAdmins(configBytes)
+	return err
+}
 
 // parseValidatorAdmins reads "validatorAdmins" and "validatorAdminThreshold"
 // from the chain config. A threshold outside 1..len(admins) is an error, so
@@ -203,10 +235,13 @@ type validatorManager struct {
 	vm     *VM
 	policy adminPolicy
 	client *p2p.Client
-	db     database.Database // the manager's part of the VM database
+	lock   changeLock
 	now    func() time.Time
+	// ready once the chain has bootstrapped: before, its view of the L1 and
+	// the P-Chain can be behind, so it signs nothing.
+	ready atomic.Bool
 
-	outstandingMu sync.Mutex
+	heldMu sync.Mutex
 }
 
 // Signature requests from peers are unauthenticated, each costing a
@@ -221,33 +256,43 @@ const (
 	maxPeers    = 10_000 // budgets kept; beyond it they start over
 )
 
-// limitedHandler rate-limits peers' signature requests, per peer and in all.
+// limitedHandler rate-limits peers' signature requests: each peer has a
+// budget; peers that aren't the L1's validators also share a global one,
+// so they can't crowd out the validators, who collect signatures from
+// each other. When too many peers are known, unknown non-validators are
+// turned away, never the budgets reset.
 type limitedHandler struct {
 	p2p.Handler
-	now    func() time.Time
-	mu     sync.Mutex
-	global *rateLimiter
-	peers  map[ids.NodeID]*rateLimiter
+	now         func() time.Time
+	isValidator func(context.Context, ids.NodeID) bool
+	mu          sync.Mutex
+	global      *rateLimiter
+	peers       map[ids.NodeID]*rateLimiter
 }
 
-func newLimitedHandler(h p2p.Handler, now func() time.Time) *limitedHandler {
-	return &limitedHandler{Handler: h, now: now, global: newRateLimiter(globalRate, globalBurst), peers: map[ids.NodeID]*rateLimiter{}}
+func newLimitedHandler(h p2p.Handler, now func() time.Time, isValidator func(context.Context, ids.NodeID) bool) *limitedHandler {
+	return &limitedHandler{Handler: h, now: now, isValidator: isValidator,
+		global: newRateLimiter(globalRate, globalBurst), peers: map[ids.NodeID]*rateLimiter{}}
 }
+
+var errBusy = appError(errCodeBusy, "too many signature requests; try again shortly")
 
 func (h *limitedHandler) AppRequest(ctx context.Context, nodeID ids.NodeID, deadline time.Time, request []byte) ([]byte, *common.AppError) {
 	now := h.now()
+	validator := h.isValidator != nil && h.isValidator(ctx, nodeID)
 	h.mu.Lock()
 	peer := h.peers[nodeID]
 	if peer == nil {
-		if len(h.peers) >= maxPeers {
-			h.peers = map[ids.NodeID]*rateLimiter{}
+		if len(h.peers) >= maxPeers && !validator {
+			h.mu.Unlock()
+			return nil, errBusy
 		}
 		peer = newRateLimiter(peerRate, peerBurst)
 		h.peers[nodeID] = peer
 	}
 	h.mu.Unlock()
-	if !peer.allow(now) || !h.global.allow(now) {
-		return nil, appError(errCodeBusy, "too many signature requests; try again shortly")
+	if !peer.allow(now) || (!validator && !h.global.allow(now)) {
+		return nil, errBusy
 	}
 	return h.Handler.AppRequest(ctx, nodeID, deadline, request)
 }
@@ -297,21 +342,16 @@ func appError(code int32, format string, args ...any) *common.AppError {
 // at least the threshold of admins.
 func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage, justification []byte) *common.AppError {
 	snowCtx := m.vm.ctx
+	now := m.clock()
+	if !m.ready.Load() {
+		return appError(errCodeBusy, "this node is still bootstrapping; it signs nothing yet")
+	}
 	if msg.NetworkID != snowCtx.NetworkID || msg.SourceChainID != snowCtx.ChainID {
 		return appError(errCodeNotManaged, "message is for network %d chain %s, not this chain", msg.NetworkID, msg.SourceChainID)
 	}
-	call, err := payload.ParseAddressedCall(msg.Payload)
-	if err != nil {
-		return appError(errCodeNotManaged, "not an addressed call: %s", err)
-	}
-	// The L1 was converted with an empty manager address; any other source
-	// address would not be accepted by the P-Chain as the manager.
-	if len(call.SourceAddress) != 0 {
-		return appError(errCodeNotManaged, "source address must be empty (the L1's manager address)")
-	}
-	parsed, err := message.Parse(call.Payload)
-	if err != nil {
-		return appError(errCodeNotManaged, "not a validator message: %s", err)
+	parsed, appErr := parseChange(msg.Bytes())
+	if appErr != nil {
+		return appErr
 	}
 	switch p := parsed.(type) {
 	case *message.RegisterL1Validator:
@@ -321,100 +361,145 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 		if p.Weight == 0 {
 			return appError(errCodeNotManaged, "a registration needs a weight above 0")
 		}
+		// The P-Chain takes a registration only before its expiry, and at
+		// most a day ahead: anything else could never be registered, or
+		// could be for longer than the lock below expects.
+		nowUnix := uint64(now.Unix())
+		if p.Expiry <= nowUnix || p.Expiry > nowUnix+uint64(MaxRegistrationLife/time.Second) {
+			return appError(errCodeNotManaged, "a registration must expire within the next %s", MaxRegistrationLife)
+		}
+		if _, err := bls.PublicKeyFromCompressedBytes(p.BLSPublicKey[:]); err != nil {
+			return appError(errCodeNotManaged, "the registration's BLS key doesn't parse: %s", err)
+		}
 	case *message.L1ValidatorWeight:
-		// checkChange checks the validation is this L1's; the P-Chain checks
-		// the nonce is fresh.
-	default:
-		return appError(errCodeNotManaged, "this chain signs validator registrations and weight changes only, not %T", parsed)
+		// Its validation and nonce are checked against the P-Chain below.
 	}
 	if m.policy.admins.Len() == 0 {
 		return appError(errCodeNotApproved, "this node has no validatorAdmins in its chain config, so it approves no validator changes")
 	}
-	approvers, err := m.policy.approvers(msg.Bytes(), justification, m.clock())
+	approvers, flags, err := m.policy.approvers(msg.Bytes(), justification, now)
 	if err != nil {
 		return appError(errCodeNotApproved, "%s", err)
 	}
 	if approvers.Len() < m.policy.threshold {
 		return appError(errCodeNotApproved, "approved by %d of this L1's admins; it needs %d", approvers.Len(), m.policy.threshold)
 	}
-	current, _, err := snowCtx.ValidatorState.GetCurrentValidatorSet(ctx, snowCtx.SubnetID)
+	all := approvers.Len() >= m.policy.admins.Len()
+	replaceHeld := flags&FlagReplaceHeld != 0
+	if replaceHeld && !all {
+		return appError(errCodeNotApproved, "only every admin together may replace a change the validators hold; %d of %d approved", approvers.Len(), m.policy.admins.Len())
+	}
+
+	// From reading the P-Chain to recording the change, one change at a time.
+	m.heldMu.Lock()
+	defer m.heldMu.Unlock()
+	current, height, err := snowCtx.ValidatorState.GetCurrentValidatorSet(ctx, snowCtx.SubnetID)
 	if err != nil {
 		return appError(errCodeNotManaged, "reading the L1's validators: %s", err)
 	}
-	m.outstandingMu.Lock()
-	defer m.outstandingMu.Unlock()
-	if appErr := m.checkOutstanding(msg.Bytes(), parsed, current); appErr != nil {
-		return appErr
+	if w, ok := parsed.(*message.L1ValidatorWeight); ok {
+		v, ok := current[w.ValidationID]
+		if !ok {
+			return appError(errCodeNotManaged, "validation %s is not one of this L1's validators", w.ValidationID)
+		}
+		if w.Nonce != v.MinNonce {
+			return appError(errCodeNotManaged, "the weight change has nonce %d; the P-Chain expects %d for this validation", w.Nonce, v.MinNonce)
+		}
+	}
+	held, err := m.lock.read()
+	if err != nil {
+		return appError(errCodeBusy, "%s", err)
+	}
+	same := held != nil && bytes.Equal(held.Message, msg.Bytes())
+	if held != nil && !same && !replaceHeld {
+		if height < held.Height {
+			return appError(errCodeBusy, "this node's view of the P-Chain (height %d) is older than the change it holds (%d); try again shortly", height, held.Height)
+		}
+		if appErr := checkHeld(held, parsed, current, now); appErr != nil {
+			return appErr
+		}
 	}
 	if appErr := m.policy.checkChange(parsed, current, approvers.Len()); appErr != nil {
 		return appErr
 	}
-	if err := m.db.Put(outstandingKey, msg.Bytes()); err != nil {
-		return appError(errCodeBusy, "recording the change before signing it: %s", err)
+	if !same {
+		if err := m.lock.write(heldChange{Message: msg.Bytes(), Height: height}); err != nil {
+			return appError(errCodeBusy, "recording the change before signing it: %s", err)
+		}
 	}
 	return nil
 }
-
-// outstandingKey holds the unsigned message of the change this node signed
-// last, in the manager's part of the VM database.
-var outstandingKey = []byte("outstanding")
 
 // Past a registration's expiry, the P-Chain (whose clock can trail this
 // node's) can't take it: wait this much longer to be sure.
 const expirySlack = 10 * time.Minute
 
-// checkOutstanding refuses a change while another this node signed may
-// still reach the P-Chain (see the package comment).
-func (m *validatorManager) checkOutstanding(msg []byte, change message.Payload, current map[ids.ID]*validators.GetCurrentValidatorOutput) *common.AppError {
-	prev, err := m.db.Get(outstandingKey)
-	if errors.Is(err, database.ErrNotFound) || (err == nil && bytes.Equal(prev, msg)) {
-		return nil
+// checkHeld refuses a new change while the one held may still reach the
+// P-Chain. It's released only on evidence from a view at least as new as
+// the held change's: the registration on the P-Chain or past its expiry,
+// the weight change's nonce passed, or its validation gone (it was there
+// when the change was held).
+func checkHeld(held *heldChange, change message.Payload, current map[ids.ID]*validators.GetCurrentValidatorOutput, now time.Time) *common.AppError {
+	prev, appErr := parseChange(held.Message)
+	if appErr != nil {
+		return appError(errCodeNotApproved, "the change this node holds can't be read (%s); only every admin together can replace it", appErr.Message)
 	}
-	if err != nil {
-		return appError(errCodeBusy, "reading the change signed last: %s", err)
-	}
-	prevChange, err := parseChange(prev)
-	if err != nil {
-		// Unreadable (a format this node no longer knows): it can't be told
-		// apart from a live change, so it holds until an operator clears it.
-		return appError(errCodeNotApproved, "the change this node signed last can't be read (%s); nothing else is signed until it's cleared", err)
-	}
-	done := false
 	var what string
-	switch p := prevChange.(type) {
+	switch p := prev.(type) {
 	case *message.RegisterL1Validator:
-		_, registered := current[p.ValidationID()]
-		expired := m.clock().After(time.Unix(int64(p.Expiry), 0).Add(expirySlack))
-		done = registered || expired
-		what = fmt.Sprintf("registration %s, until it's registered or expires at %s", p.ValidationID(), time.Unix(int64(p.Expiry), 0).UTC().Format(time.RFC3339))
+		if _, registered := current[p.ValidationID()]; registered {
+			return nil
+		}
+		if uint64(now.Unix()) > p.Expiry+uint64(expirySlack/time.Second) {
+			return nil
+		}
+		what = fmt.Sprintf("registration %s, until it's registered or expires at %s", p.ValidationID(), time.Unix(int64(min(p.Expiry, math.MaxInt64)), 0).UTC().Format(time.RFC3339))
 	case *message.L1ValidatorWeight:
 		v, ok := current[p.ValidationID]
-		done = !ok || v.MinNonce > p.Nonce
-		if w, same := change.(*message.L1ValidatorWeight); !done && same && w.ValidationID == p.ValidationID && w.Nonce == p.Nonce {
+		if !ok || v.MinNonce > p.Nonce {
+			return nil
+		}
+		if w, same := change.(*message.L1ValidatorWeight); same && w.ValidationID == p.ValidationID && w.Nonce == p.Nonce {
 			return nil // replaces it: the P-Chain takes only one change per nonce
 		}
 		what = fmt.Sprintf("weight %d for validation %s at nonce %d, until the P-Chain has it", p.Weight, p.ValidationID, p.Nonce)
 	}
-	if !done {
-		return appError(errCodeNotApproved, "this node signed another validator change that isn't on the P-Chain yet (%s): submit that one first, or replace a weight change at the same nonce", what)
-	}
-	if err := m.db.Delete(outstandingKey); err != nil {
-		return appError(errCodeBusy, "clearing the change signed last: %s", err)
-	}
-	return nil
+	return appError(errCodeNotApproved, "this node signed another validator change that isn't on the P-Chain yet (%s): submit that one first, or replace a weight change at the same nonce", what)
 }
 
-// parseChange is the validator change in an unsigned Warp message.
-func parseChange(unsignedBytes []byte) (message.Payload, error) {
+// parseChange is the validator change in an unsigned Warp message from this
+// chain's manager (an empty source address), checked as the P-Chain will.
+func parseChange(unsignedBytes []byte) (message.Payload, *common.AppError) {
 	unsigned, err := warp.ParseUnsignedMessage(unsignedBytes)
 	if err != nil {
-		return nil, err
+		return nil, appError(errCodeNotManaged, "not a Warp message: %s", err)
 	}
 	call, err := payload.ParseAddressedCall(unsigned.Payload)
 	if err != nil {
-		return nil, err
+		return nil, appError(errCodeNotManaged, "not an addressed call: %s", err)
 	}
-	return message.Parse(call.Payload)
+	// The L1 was converted with an empty manager address; any other source
+	// address would not be accepted by the P-Chain as the manager.
+	if len(call.SourceAddress) != 0 {
+		return nil, appError(errCodeNotManaged, "source address must be empty (the L1's manager address)")
+	}
+	parsed, err := message.Parse(call.Payload)
+	if err != nil {
+		return nil, appError(errCodeNotManaged, "not a validator message: %s", err)
+	}
+	switch p := parsed.(type) {
+	case *message.RegisterL1Validator:
+		if err := p.Verify(); err != nil {
+			return nil, appError(errCodeNotManaged, "invalid registration: %s", err)
+		}
+	case *message.L1ValidatorWeight:
+		if err := p.Verify(); err != nil {
+			return nil, appError(errCodeNotManaged, "invalid weight change: %s", err)
+		}
+	default:
+		return nil, appError(errCodeNotManaged, "this chain signs validator registrations and weight changes only, not %T", parsed)
+	}
+	return parsed, nil
 }
 
 func (m *validatorManager) clock() time.Time {
@@ -443,7 +528,7 @@ func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*val
 		}
 		seats[id] = s
 	}
-	newcomer := false
+	newcomer, newWeight := false, uint64(0)
 	switch c := change.(type) {
 	case *message.RegisterL1Validator:
 		id := c.ValidationID()
@@ -464,7 +549,7 @@ func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*val
 		// Until it's funded and online it can't sign: count it in the
 		// total, not in what can sign.
 		seats[id] = &seat{weight: c.Weight, key: key}
-		newcomer = true
+		newcomer, newWeight = true, c.Weight
 	case *message.L1ValidatorWeight:
 		s, ok := seats[c.ValidationID]
 		if !ok {
@@ -499,17 +584,21 @@ func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*val
 	if active == 0 {
 		return appError(errCodeNotManaged, "that would leave the L1 with no active validator")
 	}
-	// Afterwards the validators that can sign today must still make 67% of
-	// the whole weight, or no later change could be signed. Growing from
-	// one validator can't meet that (the newcomer must come online first):
-	// only every admin together may count on it.
-	if !quorumOf(signable, total) && !(newcomer && all) {
-		msg := "after this change the validators able to sign hold %s of the L1's weight; the P-Chain needs 67%%, so no later change could be signed"
+	if total.Cmp(new(big.Int).SetUint64(math.MaxUint64)) > 0 {
+		return appError(errCodeNotManaged, "the L1's total weight would pass the P-Chain's limit")
+	}
+	// Afterwards the validators that can sign now must still make 67% of the
+	// whole weight, or no later change could be signed. A newcomer can't
+	// sign until it's funded and online: add it at a weight the others
+	// outweigh, and raise it once it's active.
+	if !quorumOf(signable, total) {
+		msg := fmt.Sprintf("after this change the validators able to sign hold %s of the L1's weight; the P-Chain needs 67%%, so no later change could be signed",
+			percent(signable, total))
 		if newcomer {
-			msg += " until the new validator is funded and online: counting on that needs all %d admins"
-			return appError(errCodeNotApproved, msg, percent(signable, total), p.admins.Len())
+			rest := new(big.Int).Sub(total, new(big.Int).SetUint64(newWeight))
+			msg += fmt.Sprintf(". Register it at a weight of at most %s, and raise it once it's active", MaxNewcomerWeight(signable, rest))
 		}
-		return appError(errCodeNotApproved, msg, percent(signable, total))
+		return appError(errCodeNotApproved, "%s", msg)
 	}
 	// One key that could block the quorum alone: the rest wouldn't make 67%.
 	for _, w := range byKey {
@@ -520,6 +609,19 @@ func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*val
 		}
 	}
 	return nil
+}
+
+// MaxNewcomerWeight is the largest weight a new validator can be registered
+// at while the validators able to sign still make 67% of the whole, given
+// what can sign and the registered total without it:
+// signable*100 >= (total+w)*67. Zero if they already don't.
+func MaxNewcomerWeight(signable, total *big.Int) *big.Int {
+	w := new(big.Int).Mul(signable, big.NewInt(100))
+	w.Sub(w, new(big.Int).Mul(total, big.NewInt(67)))
+	if w.Sign() <= 0 {
+		return new(big.Int)
+	}
+	return w.Div(w, big.NewInt(67))
 }
 
 // quorumOf is the P-Chain's check: signed*100 >= total*67.
@@ -554,37 +656,37 @@ func percent(w, total *big.Int) string {
 // who gave them. An approval from a key that isn't an admin, a second one
 // from the same admin, or a justification that isn't whole approvals
 // refuses the lot: a well-formed request never has them.
-func (p adminPolicy) approvers(unsignedMessage, justification []byte, now time.Time) (set.Set[ids.ShortID], error) {
-	deadline, sigs, err := decodeJustification(justification)
+func (p adminPolicy) approvers(unsignedMessage, justification []byte, now time.Time) (set.Set[ids.ShortID], byte, error) {
+	flags, deadline, sigs, err := decodeJustification(justification)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	switch at := time.Unix(int64(deadline), 0); {
 	case deadline > uint64(now.Add(MaxApprovalLife).Unix()):
-		return nil, fmt.Errorf("the approvals' deadline %s is more than %s away", at.UTC().Format(time.RFC3339), MaxApprovalLife)
+		return nil, 0, fmt.Errorf("the approvals' deadline %s is more than %s away", at.UTC().Format(time.RFC3339), MaxApprovalLife)
 	case uint64(now.Unix()) > deadline:
-		return nil, fmt.Errorf("the approvals expired at %s", at.UTC().Format(time.RFC3339))
+		return nil, 0, fmt.Errorf("the approvals expired at %s", at.UTC().Format(time.RFC3339))
 	}
 	if len(sigs) > p.admins.Len() {
-		return nil, fmt.Errorf("%d approvals, but this L1 has only %d admins", len(sigs), p.admins.Len())
+		return nil, 0, fmt.Errorf("%d approvals, but this L1 has only %d admins", len(sigs), p.admins.Len())
 	}
-	hash := ApprovalHash(unsignedMessage, deadline)
+	hash := ApprovalHash(unsignedMessage, flags, deadline)
 	approvers := set.NewSet[ids.ShortID](len(sigs))
 	for i, sig := range sigs {
 		pub, err := secp256k1.RecoverPublicKeyFromHash(hash, sig)
 		if err != nil {
-			return nil, fmt.Errorf("approval %d: %w", i+1, err)
+			return nil, 0, fmt.Errorf("approval %d: %w", i+1, err)
 		}
 		who := pub.Address()
 		if !p.admins.Contains(who) {
-			return nil, fmt.Errorf("approval %d is by %s, which is not one of this L1's validatorAdmins", i+1, who)
+			return nil, 0, fmt.Errorf("approval %d is by %s, which is not one of this L1's validatorAdmins", i+1, who)
 		}
 		if approvers.Contains(who) {
-			return nil, fmt.Errorf("approval %d repeats admin %s", i+1, who)
+			return nil, 0, fmt.Errorf("approval %d repeats admin %s", i+1, who)
 		}
 		approvers.Add(who)
 	}
-	return approvers, nil
+	return approvers, flags, nil
 }
 
 // Aggregate signs an approved change with this node's key, collects the
@@ -795,9 +897,12 @@ func containsNode(nodeIDs []ids.NodeID, want ids.NodeID) bool {
 
 // newValidatorManager registers the ACP-118 signature handler on the VM's
 // p2p network and a client for collecting signatures.
-func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy, db database.Database) (*validatorManager, error) {
-	m := &validatorManager{vm: vm, policy: policy, db: db}
-	handler := newLimitedHandler(acp118.NewHandler(m, vm.ctx.WarpSigner), m.clock)
+func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy, lockPath string) (*validatorManager, error) {
+	m := &validatorManager{vm: vm, policy: policy, lock: changeLock{path: lockPath}}
+	isValidator := func(ctx context.Context, nodeID ids.NodeID) bool {
+		return vm.p2pValidators != nil && vm.p2pValidators.Has(ctx, nodeID)
+	}
+	handler := newLimitedHandler(acp118.NewHandler(m, vm.ctx.WarpSigner), m.clock, isValidator)
 	if err := network.AddHandler(acp118.HandlerID, handler); err != nil {
 		return nil, fmt.Errorf("registering the signature handler: %w", err)
 	}

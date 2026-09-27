@@ -11,17 +11,21 @@
 #    validatorAdmins: three admin keys made here, any two of which approve
 #    (validatorAdminThreshold 2).
 # 3. Adds nodes 2, 3 and 4: request -> approve (admin 1 starts the
-#    proposal) -> approve (the next admins; the last submits via node 1) ->
-#    register (paid by the local network's public ewoq key). Nodes 2 and 3
-#    each leave a validator with a third or more of the weight, so they need
-#    all three admins; node 4 (25% each) needs two.
+#    proposal) -> approve (the next admins) -> submit via node 1 -> register
+#    (paid by the local network's public ewoq key). A newcomer can't sign
+#    until it's active, so nodes 2 and 3 join at small weights (40, 90) and
+#    are raised to 100 once active; with up to three validators one could
+#    block the 67% alone, so those changes need all three admins. Node 4
+#    joins at 100 (25% each) with two.
 # 4. Sends payments until each of the four validators has built blocks and
 #    been paid their fees; node 5, not a validator, builds none.
 # 5. Removes node 3: two admins are refused (it leaves 33.3% each), all
 #    three succeed; it builds no more blocks.
 # 6. Checks refusals: one admin alone, an admin with an outsider, an admin
-#    twice, two admins adding a heavy validator (50%), and the signing
+#    twice, a heavy validator (50%, even with every admin), and the signing
 #    endpoint without the RPC login.
+# 7. Checks validators sign one change at a time, and that every admin
+#    together can replace a held change.
 #
 # Development only: the keys are public. State in DEVNET_DIR (default
 # ~/.btcvm-validators-devnet), deleted at the start of each run. KEEP=1 leaves
@@ -201,33 +205,53 @@ submit_and_register() { # NODE
   "$BIN/btcvm-l1" register -registration "$DIR/registration$1.json" -key "$DIR/ewoq.json" \
     -uri "$(uri "$1")" -balance 1 >"$DIR/registered$1.json"
 }
-add_validator() { # NODE ADMIN...: admin 1 starts the proposal, the others follow
-  local i=$1 id
-  shift
+add_validator() { # NODE WEIGHT ADMIN...: admin 1 starts the proposal, the others follow
+  local i=$1 w=$2 id
+  shift 2
   "$BIN/btcvm-l1" request -node-uri "$(uri "$i")" -owner "$EWOQ_P" >"$DIR/request$i.json"
   id=$(jq -r .nodeID "$DIR/request$i.json")
-  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request$i.json" -key "$DIR/admin1.json" -yes \
+  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request$i.json" -key "$DIR/admin1.json" -weight "$w" -yes \
     >"$DIR/proposal$i.json"
   approvals "$DIR/proposal$i.json" "$@"
   settling submit_and_register "$i"
   wait_for 60 "node $i on the validator list" has_validator "$id"
-  ok "node $i ($id) is a validator: $(jq -r .txID "$DIR/registered$i.json")"
+  ok "node $i ($id) is a validator at weight $w: $(jq -r .txID "$DIR/registered$i.json")"
+}
+raise() { # NODE WEIGHT ADMIN...: set a validator's weight, once it's active
+  local i=$1 w=$2
+  shift 2
+  "$BIN/btcvm-l1" set-weight "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$(jq -r .validationID "$DIR/registration$i.json")" \
+    -weight "$w" -key "$DIR/admin1.json" -yes >"$DIR/raise$i.json"
+  approvals "$DIR/raise$i.json" "$@"
+  settling submit "$DIR/raise$i.json" "$DIR/raised$i.json"
+  wait_for 60 "node $i at weight $w" weight_is "$(jq -r .nodeID "$DIR/registration$i.json")" "$w"
+  ok "node $i raised to weight $w"
 }
 log "Add validators"
-# 1 -> 2 validators (50% each) and 2 -> 3 (33.3%): every admin.
+weight_is() { validators | jq -e --arg n "$1" --argjson w "$2" 'map(select(.nodeID == $n))[0].weight == $w' >/dev/null; }
 "$BIN/btcvm-l1" request -node-uri "$(uri 2)" -owner "$EWOQ_P" >"$DIR/request2.json"
-"$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request2.json" -key "$DIR/admin1.json" -yes \
-  >"$DIR/proposal2-two.json"
+# A second validator at 100: only 100 of 200 could sign until it's active.
+"$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request2.json" -key "$DIR/admin1.json" -yes >"$DIR/proposal2-full.json"
+approvals "$DIR/proposal2-full.json" 2 3
+if submit "$DIR/proposal2-full.json" "$DIR/out2.json" 2>"$DIR/err2.txt"; then
+  fail "a second validator at full weight was signed (only half the weight could sign)"
+fi
+grep -q "at most 49" "$DIR/err2.txt" || fail "unexpected refusal: $(cat "$DIR/err2.txt")"
+ok "a newcomer at full weight is refused: $(grep -o 'Register it at a weight of at most [0-9]*' "$DIR/err2.txt" | head -1)"
+# At 40, node 1 alone could still block the 67%: every admin, not two.
+"$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request2.json" -key "$DIR/admin1.json" -weight 40 -yes >"$DIR/proposal2-two.json"
 approvals "$DIR/proposal2-two.json" 2
 if submit "$DIR/proposal2-two.json" "$DIR/out2.json" 2>"$DIR/err2.txt"; then
-  fail "two admins added a second validator (50% of the weight)"
+  fail "two admins added a validator while one could block the 67% alone"
 fi
 grep -q "needs all 3 admins" "$DIR/err2.txt" || fail "unexpected refusal: $(cat "$DIR/err2.txt")"
-ok "two admins can't add a validator that would hold 50%: $(grep -o 'after this change[^;:]*' "$DIR/err2.txt" | head -1)"
-add_validator 2 2 3
-add_validator 3 2 3
-# 3 -> 4 (25% each): two admins are enough.
-add_validator 4 2
+ok "two admins can't while one validator could block the 67%"
+add_validator 2 40 2 3
+raise 2 100 2 3
+add_validator 3 90 2 3
+raise 3 100 2 3
+# 3 -> 4 at 100: 300 of 400 can sign, 25% each: two admins are enough.
+add_validator 4 100 2
 [[ $(validator_count) == 4 ]] || fail "expected 4 validators, got $(validator_count)"
 
 # --- 4. Blocks and fees ---------------------------------------------------------------
@@ -345,14 +369,14 @@ if "$BIN/btcvm-l1" approve "${L1[@]}" -proposal "$DIR/proposal5.json" -key "$DIR
   fail "one admin approved the same change twice"
 fi
 ok "an admin can't approve twice"
-# 3 validators at 100 plus one at 300: 50%. Two admins aren't enough.
+# 3 validators at 100 plus one at 300: only half the weight could sign.
 "$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request5.json" -key "$DIR/admin1.json" -weight 300 -yes >"$DIR/heavy5.json"
 approvals "$DIR/heavy5.json" 2
 if submit "$DIR/heavy5.json" "$DIR/out5.json" 2>"$DIR/err6.txt"; then
   fail "two admins added a validator with 50% of the weight"
 fi
-grep -q "needs all 3 admins" "$DIR/err6.txt" || fail "unexpected refusal: $(cat "$DIR/err6.txt")"
-ok "a heavy validator needs every admin: $(grep -o 'after this change[^;:]*' "$DIR/err6.txt" | head -1)"
+grep -q "able to sign hold" "$DIR/err6.txt" || fail "unexpected refusal: $(cat "$DIR/err6.txt")"
+ok "a heavy newcomer is refused: $(grep -o 'after this change[^;]*' "$DIR/err6.txt" | head -1)"
 echo wrong >"$DIR/wrong-password"
 if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/proposal5.json" -yes \
   -key "$DIR/admin2.json" -rpc-pass-file "$DIR/wrong-password" >/dev/null 2>"$DIR/err5.txt"; then
@@ -379,5 +403,17 @@ grep -q "isn't on the P-Chain yet" "$DIR/err7.txt" || fail "unexpected refusal: 
 ok "a second change waits for the first: $(grep -o "this node signed another validator change[^(]*" "$DIR/err7.txt" | head -1)"
 submit "$DIR/pending5.json" "$DIR/signed5-again.json" || fail "the same change wasn't signed again"
 ok "the outstanding change itself can be signed again"
+# The way out when validators hold changes that can't go ahead: every admin
+# together approves one flagged to replace them.
+"$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N4" -key "$DIR/admin1.json" -replace-held -yes >"$DIR/replace4.json"
+approvals "$DIR/replace4.json" 2
+if submit "$DIR/replace4.json" "$DIR/replaced4.json" 2>"$DIR/err8.txt"; then
+  fail "two admins replaced a held change"
+fi
+grep -q "only every admin together" "$DIR/err8.txt" || fail "unexpected refusal: $(cat "$DIR/err8.txt")"
+approvals "$DIR/replace4.json" 3
+settling submit "$DIR/replace4.json" "$DIR/replaced4.json"
+wait_for 60 "node 4 off the validator list" not_validator "$(jq -r .nodeID "$DIR/registration4.json")"
+ok "every admin together replaced the held change: node 4 removed"
 
 log "PASS: validators added, took turns building blocks, were paid their fees, and one was removed"

@@ -26,6 +26,9 @@ package main
 //	candidate:  btcvm-l1 register -registration registration.json -key my-p-chain-key.json -balance 1
 //	admin 1:    btcvm-l1 remove -validation-id ... -key admin1-key.json -node-uri ... > proposal.json
 //	            (then approve -proposal and submit as above; submit -payer-key pays the P-Chain fee)
+//	admin 1:    btcvm-l1 set-weight -validation-id ... -weight 100 -key admin1-key.json -node-uri ... > proposal.json
+//	            (a new validator starts at a small weight, since it can't sign until
+//	            it's funded and online; raise it once it's active)
 //	anyone:     btcvm-l1 top-up -validation-id ... -key p-chain-key.json -balance 1
 //	owner:      btcvm-l1 disable -validation-id ... -key owner-key.json   (ends it; the unused balance returns to the owner)
 //	anyone:     btcvm-l1 validators -node-uri ...
@@ -40,6 +43,17 @@ package main
 // deadlines by its own clock and the P-Chain by its own view of it, so
 // leave margin: a change near its deadline, or moments after another,
 // can be refused by some and signed by others.
+//
+// If validators end up holding different changes, so that none gathers
+// 67%, every admin together can start a change with -replace-held: it
+// replaces whatever they hold. A held change already signed by enough
+// validators can still reach the P-Chain, so check none is waiting first.
+//
+// A validator keeps the change it holds in <dataDir>/validator-manager/
+// held-change.json. Never start one on a restored or copied data directory
+// without the admins checking no change is outstanding: it could hold an
+// older change than the one it really signed. Each operator's -owner key
+// is its own: the owner can disable the validator.
 //
 // Nothing secret changes hands: a request holds the candidate's NodeID and
 // BLS public key and proof of possession; a proposal holds the unsigned
@@ -204,8 +218,11 @@ type proposal struct {
 	UnsignedMessage string `json:"unsignedMessage"`
 	// Every approval is of the message until this time (Unix seconds); the
 	// validators refuse approvals past it.
-	Deadline    uint64   `json:"deadline"`
-	DeadlineUTC string   `json:"deadlineUTC"`
+	Deadline    uint64 `json:"deadline"`
+	DeadlineUTC string `json:"deadlineUTC"`
+	// Replaces whatever change the validators hold (every admin must
+	// approve): the way out if validators hold different changes.
+	ReplaceHeld bool     `json:"replaceHeld,omitempty"`
 	Approvals   []string `json:"approvals"`
 	ApprovedBy  []string `json:"approvedBy"`
 	// For a registration: what the candidate needs to register.
@@ -310,6 +327,14 @@ func (c *change) check(p *proposal) error {
 	return nil
 }
 
+// flags are the approval flags every admin signs with.
+func (p *proposal) flags() byte {
+	if p.ReplaceHeld {
+		return vm.FlagReplaceHeld
+	}
+	return 0
+}
+
 // setDeadline fixes the time every approval of the proposal is good until.
 func (p *proposal) setDeadline(t time.Time) {
 	p.Deadline = uint64(t.Unix())
@@ -318,7 +343,7 @@ func (p *proposal) setDeadline(t time.Time) {
 
 // approvals decodes a proposal's approvals and who gave each.
 func (p *proposal) approvals(unsigned *warp.UnsignedMessage) ([][]byte, []ids.ShortID, error) {
-	hash := vm.ApprovalHash(unsigned.Bytes(), p.Deadline)
+	hash := vm.ApprovalHash(unsigned.Bytes(), p.flags(), p.Deadline)
 	var sigs [][]byte
 	var who []ids.ShortID
 	for i, a := range p.Approvals {
@@ -350,7 +375,7 @@ func (p *proposal) addApproval(unsigned *warp.UnsignedMessage, networkID uint32,
 			return errors.New("this key has already approved this change")
 		}
 	}
-	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes(), p.Deadline))
+	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes(), p.flags(), p.Deadline))
 	if err != nil {
 		return err
 	}
@@ -403,12 +428,12 @@ func readProposal(path string, networkID uint32, chainID ids.ID) (*proposal, *ch
 
 // collect has the validator node at nodeURI collect the L1 validators'
 // signatures on an approved change.
-func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, deadline uint64, approvals [][]byte) (*warp.Message, error) {
+func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, flags byte, deadline uint64, approvals [][]byte) (*warp.Message, error) {
 	pass, err := os.ReadFile(rpcPassFile)
 	if err != nil {
 		return nil, fmt.Errorf("-rpc-pass-file: %w", err)
 	}
-	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(vm.EncodeJustification(deadline, approvals))})
+	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(vm.EncodeJustification(flags, deadline, approvals))})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(nodeURI, "/")+"/ext/bc/"+chainID.String()+"/validators", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -475,7 +500,7 @@ func submit(p *proposal, c *change, nodeURI string, chainID ids.ID, f submitFlag
 	if c.weight != nil && *f.payerPath == "" {
 		return errors.New("-payer-key is needed to issue a weight change")
 	}
-	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, p.Deadline, sigs)
+	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, p.flags(), p.Deadline, sigs)
 	if err != nil {
 		return err
 	}
@@ -521,10 +546,14 @@ func cmdApprove(args []string) error {
 	valid := fs.Duration("valid-for", 23*time.Hour, "with -request: how long the admins and the candidate have to finish (at most 24h, which the P-Chain counts from when it is registered)")
 	yes := fs.Bool("yes", false, "approve without asking")
 	offline := fs.Bool("offline", false, "approve without the share preview (no P-Chain access)")
+	replaceHeld := fs.Bool("replace-held", false, "with -request: the change replaces whatever change the validators hold (only if every admin approves; for validators stuck holding different changes)")
 	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
 	if (*requestPath == "") == (*proposalPath == "") || *keyPath == "" {
 		return errors.New("-key and one of -request or -proposal are required")
+	}
+	if *replaceHeld && *proposalPath != "" {
+		return errors.New("-replace-held is set when a proposal starts (with -request), not later")
 	}
 	chainID, subnetID, err := l1.ids()
 	if err != nil {
@@ -550,7 +579,7 @@ func cmdApprove(args []string) error {
 			return err
 		}
 		c = &change{unsigned: unsigned, reg: reg}
-		p = &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), BLSProofOfPossession: pop}
+		p = &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), BLSProofOfPossession: pop, ReplaceHeld: *replaceHeld}
 		if err := c.label(p); err != nil {
 			return err
 		}
@@ -620,6 +649,10 @@ func registrationFor(requestPath string, subnetID ids.ID, weight uint64, expiry 
 func confirm(p *proposal, c *change, nodeURI string, subnetID ids.ID, yes, offline bool) error {
 	fmt.Fprintf(os.Stderr, "\nThe change:      %s\n", p.Summary)
 	fmt.Fprintf(os.Stderr, "Approvals until: %s\n", p.DeadlineUTC)
+	if p.ReplaceHeld {
+		fmt.Fprint(os.Stderr, "REPLACES whatever change the validators hold, and needs every admin. A held change that was\n"+
+			"already signed by enough validators can still reach the P-Chain: check none is waiting to be submitted.\n")
+	}
 	if len(p.ApprovedBy) > 0 {
 		fmt.Fprintf(os.Stderr, "Approved by:     %s (recovered from their signatures)\n", strings.Join(p.ApprovedBy, ", "))
 	}
@@ -711,10 +744,23 @@ func shareReport(c *change, nodeURI string, subnetID ids.ID, offline bool) (stri
 		fmt.Fprintf(&b, "%-56s %13s %13s\n", r.id, pct(r.before, before), pct(r.after, after))
 	}
 	fmt.Fprintf(&b, "Afterwards the validators able to sign now hold %s of the weight (the P-Chain needs 67%%).\n", pct(signable, after))
-	sort.Slice(weights, func(i, j int) bool { return weights[i].Cmp(weights[j]) > 0 })
+	if c.reg != nil {
+		rest := new(big.Int).Sub(after, new(big.Int).SetUint64(c.reg.Weight))
+		maxW := vm.MaxNewcomerWeight(signable, rest)
+		fmt.Fprintf(&b, "A new validator can't sign until it's funded and online: register it at a weight of at most %s, then raise it once it's active.\n", maxW)
+	}
+	// How many of the validators able to sign could be offline: only they
+	// count toward the 67%, of the whole registered weight.
+	var activeWeights []*big.Int
+	for _, r := range rows {
+		if r.active && r.after.Sign() > 0 {
+			activeWeights = append(activeWeights, r.after)
+		}
+	}
+	sort.Slice(activeWeights, func(i, j int) bool { return activeWeights[i].Cmp(activeWeights[j]) > 0 })
 	tolerate := 0
-	left := new(big.Int).Set(after)
-	for _, w := range weights {
+	left := new(big.Int).Set(signable)
+	for _, w := range activeWeights {
 		rest := new(big.Int).Sub(left, w)
 		if !vm.Quorum(rest, after) {
 			break
@@ -774,8 +820,8 @@ func cmdRegister(args []string) error {
 	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
 	balance := fs.Float64("balance", 1, "METAL for the validator's continuous P-Chain fee")
 	otherNode := fs.Bool("other-node", false, "register it though it isn't for the node at -uri (then -candidate-uri is the candidate's node)")
-	candidateURI := fs.String("candidate-uri", "", "with -other-node: the candidate node's API, to check it has bootstrapped")
-	skipBootstrap := fs.Bool("skip-bootstrap-check", false, "with -other-node and no -candidate-uri: register without checking the candidate has bootstrapped")
+	candidateURI := fs.String("candidate-uri", "", "with -other-node: the candidate node's API, to check the registration is for it and it has bootstrapped")
+	skipBootstrap := fs.Bool("skip-bootstrap-check", false, "register without checking the candidate has bootstrapped (it counts as a validator at once)")
 	lowBalance := fs.Bool("low-balance", false, "allow a starting balance under 1 METAL (under a month of fees)")
 	_ = fs.Parse(args)
 	if *regPath == "" || *keyPath == "" {
@@ -806,9 +852,12 @@ func cmdRegister(args []string) error {
 		nodeID, inner.Weight, inner.RemainingBalanceOwner.Addresses)
 	candidate := *uri
 	if *otherNode {
+		if *candidateURI == "" {
+			return errors.New("-other-node needs -candidate-uri: the candidate's node, to check the registration is for it")
+		}
 		candidate = *candidateURI
 	}
-	if candidate != "" {
+	{
 		mine, pop, err := info.NewClient(candidate).GetNodeID(context.Background())
 		if err != nil {
 			return fmt.Errorf("reading the candidate node at %s (to check the registration is for it): %w", candidate, err)
@@ -823,6 +872,10 @@ func cmdRegister(args []string) error {
 			return err
 		}
 		for _, chain := range []string{"P", msg.UnsignedMessage.SourceChainID.String()} {
+			if *skipBootstrap {
+				fmt.Fprintln(os.Stderr, "WARNING: not checking the candidate node has bootstrapped; it counts as a validator from the moment it's registered")
+				break
+			}
 			done, err := info.NewClient(candidate).IsBootstrapped(context.Background(), chain)
 			if err != nil {
 				return fmt.Errorf("asking the candidate node whether it has bootstrapped %s: %w", chain, err)
@@ -831,10 +884,6 @@ func cmdRegister(args []string) error {
 				return fmt.Errorf("the candidate node hasn't finished bootstrapping %s; register once it has (sudo ./setup.sh --status)", chain)
 			}
 		}
-	} else if !*skipBootstrap {
-		return errors.New("-other-node needs -candidate-uri (the candidate's node, to check it's ready), or -skip-bootstrap-check")
-	} else {
-		fmt.Fprintln(os.Stderr, "WARNING: not checking the candidate node has bootstrapped; it counts as a validator from the moment it's registered")
 	}
 	popBytes, err := unhex(reg.BLSProofOfPossession, "blsProofOfPossession")
 	if err != nil {
@@ -867,10 +916,21 @@ func registrationIn(signed []byte) (*message.RegisterL1Validator, error) {
 }
 
 // cmdRemove starts a proposal to remove a validator (set its weight to 0).
-func cmdRemove(args []string) error {
-	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+func cmdRemove(args []string) error { return weightProposal("remove", args, false) }
+
+// cmdSetWeight starts a proposal to change a validator's weight: to raise a
+// validator added at a small weight once it's active, say.
+func cmdSetWeight(args []string) error { return weightProposal("set-weight", args, true) }
+
+func weightProposal(name string, args []string, withWeight bool) error {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	l1 := addL1Flags(fs)
 	validationFlag := fs.String("validation-id", "", "the validator's validation ID (btcvm-l1 validators)")
+	newWeight := new(uint64)
+	if withWeight {
+		newWeight = fs.Uint64("weight", 0, "its new weight (above 0; remove sets 0)")
+	}
+	replaceHeld := fs.Bool("replace-held", false, "the change replaces whatever change the validators hold (only if every admin approves)")
 	keyPath := fs.String("key", "", "an admin key")
 	valid := fs.Duration("valid-for", 72*time.Hour, "how long the other admins have to approve (at most "+vm.MaxApprovalLife.String()+")")
 	yes := fs.Bool("yes", false, "approve without asking")
@@ -878,6 +938,9 @@ func cmdRemove(args []string) error {
 	_ = fs.Parse(args)
 	if *validationFlag == "" || *keyPath == "" {
 		return errors.New("-validation-id and -key are required")
+	}
+	if withWeight && *newWeight == 0 {
+		return errors.New("-weight must be above 0 (to remove a validator: remove)")
 	}
 	if *valid <= 0 || *valid > vm.MaxApprovalLife {
 		return fmt.Errorf("-valid-for must be between 0 and %s", vm.MaxApprovalLife)
@@ -894,7 +957,8 @@ func cmdRemove(args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading the validator: %w", err)
 	}
-	w, err := message.NewL1ValidatorWeight(validationID, current.MinNonce, 0)
+	// At the nonce the P-Chain expects next: the validators sign no other.
+	w, err := message.NewL1ValidatorWeight(validationID, current.MinNonce, *newWeight)
 	if err != nil {
 		return err
 	}
@@ -904,7 +968,7 @@ func cmdRemove(args []string) error {
 		return err
 	}
 	c := &change{unsigned: unsigned, weight: w}
-	p := &proposal{UnsignedMessage: hexBytes(unsigned.Bytes())}
+	p := &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), ReplaceHeld: *replaceHeld}
 	if err := c.label(p); err != nil {
 		return err
 	}
@@ -955,7 +1019,7 @@ func cmdDisable(args []string) error {
 	validationFlag := fs.String("validation-id", "", "the validator's validation ID")
 	keyPath := fs.String("key", "", "the validator's owner key (the -owner of its request)")
 	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
-	last := fs.Bool("last", false, "disable it even if it's the L1's last active validator (the L1 then stops)")
+	last := fs.Bool("last", false, "disable it even if that stops the L1 or leaves its validators unchangeable")
 	_ = fs.Parse(args)
 	validationID, err := ids.FromString(*validationFlag)
 	if err != nil {
@@ -971,14 +1035,28 @@ func cmdDisable(args []string) error {
 		if err != nil {
 			return fmt.Errorf("reading the L1's validators: %w", err)
 		}
+		// A disabled validator keeps its weight in the total but can't sign:
+		// the rest must still make 67%, or no change could be signed again
+		// (not even removing it).
+		total, signable := new(big.Int), new(big.Int)
 		others := 0
 		for _, o := range vdrs {
-			if o.ValidationID != nil && *o.ValidationID != validationID && o.Balance != nil && *o.Balance > 0 {
+			if o.ValidationID == nil {
+				continue
+			}
+			w := new(big.Int).SetUint64(o.Weight)
+			total.Add(total, w)
+			if *o.ValidationID != validationID && o.Balance != nil && *o.Balance > 0 {
+				signable.Add(signable, w)
 				others++
 			}
 		}
 		if others == 0 {
 			return errors.New("this is the L1's last active validator: disabling it stops the L1 (-last does it anyway)")
+		}
+		if !vm.Quorum(signable, total) {
+			return fmt.Errorf("after disabling it the validators able to sign would hold %s of the weight, under the 67%% any change needs: "+
+				"the L1's validators could never be changed again. Ask the admins to remove it instead (-last does it anyway)", vm.Percent(signable, total))
 		}
 	}
 	wallet, err := pWallet(*uri, *keyPath)

@@ -98,6 +98,12 @@ func btcvmMain() error {
 }
 
 func main() {
+	// btcvm-plugin -check-config FILE|-: whether the VM would accept a chain
+	// config's validator settings; for installers, before they restart.
+	if len(os.Args) == 3 && (os.Args[1] == "-check-config" || os.Args[1] == "--check-config") {
+		os.Exit(checkChainConfig(os.Args[2]))
+	}
+
 	// Override GC percent if not explicitly set
 	if os.Getenv("GOGC") == "" {
 		// Set GC to run more frequently to avoid memory spikes

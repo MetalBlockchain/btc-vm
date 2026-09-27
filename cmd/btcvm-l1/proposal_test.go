@@ -111,6 +111,14 @@ func TestProposalApprovals(t *testing.T) {
 	if movedWho[0] == who[0] || movedWho[1] == who[1] {
 		t.Fatal("approvals still verify as the admins' after the deadline moved")
 	}
+	// So does the replace flag, turned on or off after approving: it's part
+	// of what each admin signed.
+	flipped := *read
+	flipped.ReplaceHeld = !flipped.ReplaceHeld
+	_, flippedWho, _ := flipped.approvals(rc.unsigned)
+	if flippedWho[0] == who[0] || flippedWho[1] == who[1] {
+		t.Fatal("approvals still verify as the admins' after the replace flag changed")
+	}
 	// A corrupted approval is refused.
 	read.Approvals[1] = read.Approvals[1][:len(read.Approvals[1])-2] + "zz"
 	if _, _, err := readProposal(writeProposal(t, dir, read), netID, chainID); err == nil {

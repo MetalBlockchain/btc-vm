@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/MetalBlockchain/btcvm/btcd/btcutil"
 	"github.com/MetalBlockchain/btcvm/btcd/mempool"
 	"github.com/MetalBlockchain/metalgo/database"
-	"github.com/MetalBlockchain/metalgo/database/prefixdb"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/network/p2p"
 	"github.com/MetalBlockchain/metalgo/network/p2p/gossip"
@@ -247,7 +247,9 @@ func (vm *VM) Initialize(
 	if err != nil {
 		return fmt.Errorf("failed to parse chain config: %w", err)
 	}
-	vm.validatorManager, err = newValidatorManager(vm, p2pNet, policy, prefixdb.New([]byte("validator-manager"), vm.db))
+	// The change this node signed last lives beside the chain's data, synced
+	// to disk before each signature (see changeLock).
+	vm.validatorManager, err = newValidatorManager(vm, p2pNet, policy, filepath.Join(vm.config.DataDir, "validator-manager", "held-change.json"))
 	if err != nil {
 		return err
 	}
@@ -301,6 +303,13 @@ func (vm *VM) Initialize(
 	return nil
 }
 
+// setSigningReady lets the validator manager sign once the chain is caught up.
+func (vm *VM) setSigningReady(ready bool) {
+	if vm.validatorManager != nil {
+		vm.validatorManager.ready.Store(ready)
+	}
+}
+
 // SetState sets the VM state
 func (vm *VM) SetState(ctx context.Context, state snow.State) error {
 	vm.ctx.Log.Debug("entering SetState", zap.String("state", state.String()))
@@ -311,11 +320,13 @@ func (vm *VM) SetState(ctx context.Context, state snow.State) error {
 	switch state {
 	case snow.StateSyncing:
 		vm.bootstrapped = false
+		vm.setSigningReady(false)
 		vm.ctx.Log.Info("Bitcoin VM entering state sync")
 		return nil
 
 	case snow.Bootstrapping:
 		vm.bootstrapped = false
+		vm.setSigningReady(false)
 		vm.ctx.Log.Info("Bitcoin VM bootstrapping")
 		return nil
 
@@ -326,6 +337,7 @@ func (vm *VM) SetState(ctx context.Context, state snow.State) error {
 			return nil
 		}
 		vm.bootstrapped = true
+		vm.setSigningReady(true)
 		vm.ctx.Log.Info("Bitcoin VM entering normal operation")
 
 		if err := vm.onNormalOperationsStarted(); err != nil {
