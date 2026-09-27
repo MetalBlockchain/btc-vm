@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MetalBlockchain/metalgo/database"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/network/p2p"
 	"github.com/MetalBlockchain/metalgo/network/p2p/acp118"
@@ -52,10 +53,21 @@ import (
 // deadline and M or more approvals, each by a different admin. So no one
 // admin key can change the validator set alone, and approvals expire.
 //
-// A change is also checked against the L1's current validators: a weight
-// change must be for one of them, the last one can't be removed, and a
-// change that leaves any validator with a third or more of the weight
-// (enough to block the 67% quorum alone) needs every admin.
+// A change is also checked against the L1's current validators (see
+// checkChange): a weight change must be for one of them; a registration
+// can't reuse a registered BLS key; the validators able to sign must still
+// reach the P-Chain's 67% of the whole registered weight afterwards (only a
+// registration approved by every admin may count on the newcomer); and a
+// change after which any one BLS key could block that quorum alone needs
+// every admin.
+//
+// Changes don't add up behind the policy's back: a node signs one change at
+// a time. Until the change it last signed is on the P-Chain or can no
+// longer be (a registration past its expiry, a weight change whose nonce
+// the P-Chain has moved past), it signs only that same change again, or a
+// weight change replacing it at the same nonce (only one of the two can
+// ever apply). Any 67% of the weight asked to sign a second change includes
+// validators still holding the first, so the second never gathers enough.
 //
 // Signing is node policy, not consensus: blocks and their validity are
 // unchanged, and a node with no admins configured signs nothing.
@@ -188,20 +200,57 @@ func parseValidatorAdmins(configBytes []byte) (adminPolicy, error) {
 }
 
 type validatorManager struct {
-	vm      *VM
-	policy  adminPolicy
-	client  *p2p.Client
-	limiter *rateLimiter
-	now     func() time.Time
+	vm     *VM
+	policy adminPolicy
+	client *p2p.Client
+	db     database.Database // the manager's part of the VM database
+	now    func() time.Time
+
+	outstandingMu sync.Mutex
 }
 
-// Signature requests are unauthenticated peer messages, each costing a
-// P-Chain read and signature recoveries: at most this many a second, with
-// bursts of verifyBurst.
+// Signature requests from peers are unauthenticated, each costing a
+// P-Chain read and signature recoveries. Each peer gets its own budget, and
+// all peers together a larger one; this node's own collection (Aggregate)
+// isn't limited, so peers can't starve it.
 const (
-	verifyRate  = 10
-	verifyBurst = 50
+	peerRate    = 2
+	peerBurst   = 10
+	globalRate  = 20
+	globalBurst = 100
+	maxPeers    = 10_000 // budgets kept; beyond it they start over
 )
+
+// limitedHandler rate-limits peers' signature requests, per peer and in all.
+type limitedHandler struct {
+	p2p.Handler
+	now    func() time.Time
+	mu     sync.Mutex
+	global *rateLimiter
+	peers  map[ids.NodeID]*rateLimiter
+}
+
+func newLimitedHandler(h p2p.Handler, now func() time.Time) *limitedHandler {
+	return &limitedHandler{Handler: h, now: now, global: newRateLimiter(globalRate, globalBurst), peers: map[ids.NodeID]*rateLimiter{}}
+}
+
+func (h *limitedHandler) AppRequest(ctx context.Context, nodeID ids.NodeID, deadline time.Time, request []byte) ([]byte, *common.AppError) {
+	now := h.now()
+	h.mu.Lock()
+	peer := h.peers[nodeID]
+	if peer == nil {
+		if len(h.peers) >= maxPeers {
+			h.peers = map[ids.NodeID]*rateLimiter{}
+		}
+		peer = newRateLimiter(peerRate, peerBurst)
+		h.peers[nodeID] = peer
+	}
+	h.mu.Unlock()
+	if !peer.allow(now) || !h.global.allow(now) {
+		return nil, appError(errCodeBusy, "too many signature requests; try again shortly")
+	}
+	return h.Handler.AppRequest(ctx, nodeID, deadline, request)
+}
 
 // rateLimiter is a token bucket.
 type rateLimiter struct {
@@ -247,9 +296,6 @@ func appError(code int32, format string, args ...any) *common.AppError {
 // 0 removes a validator), from this chain as the L1's manager, approved by
 // at least the threshold of admins.
 func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage, justification []byte) *common.AppError {
-	if m.limiter != nil && !m.limiter.allow(m.clock()) {
-		return appError(errCodeBusy, "too many signature requests; try again shortly")
-	}
 	snowCtx := m.vm.ctx
 	if msg.NetworkID != snowCtx.NetworkID || msg.SourceChainID != snowCtx.ChainID {
 		return appError(errCodeNotManaged, "message is for network %d chain %s, not this chain", msg.NetworkID, msg.SourceChainID)
@@ -295,7 +341,80 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 	if err != nil {
 		return appError(errCodeNotManaged, "reading the L1's validators: %s", err)
 	}
-	return m.policy.checkChange(parsed, current, approvers.Len())
+	m.outstandingMu.Lock()
+	defer m.outstandingMu.Unlock()
+	if appErr := m.checkOutstanding(msg.Bytes(), parsed, current); appErr != nil {
+		return appErr
+	}
+	if appErr := m.policy.checkChange(parsed, current, approvers.Len()); appErr != nil {
+		return appErr
+	}
+	if err := m.db.Put(outstandingKey, msg.Bytes()); err != nil {
+		return appError(errCodeBusy, "recording the change before signing it: %s", err)
+	}
+	return nil
+}
+
+// outstandingKey holds the unsigned message of the change this node signed
+// last, in the manager's part of the VM database.
+var outstandingKey = []byte("outstanding")
+
+// Past a registration's expiry, the P-Chain (whose clock can trail this
+// node's) can't take it: wait this much longer to be sure.
+const expirySlack = 10 * time.Minute
+
+// checkOutstanding refuses a change while another this node signed may
+// still reach the P-Chain (see the package comment).
+func (m *validatorManager) checkOutstanding(msg []byte, change message.Payload, current map[ids.ID]*validators.GetCurrentValidatorOutput) *common.AppError {
+	prev, err := m.db.Get(outstandingKey)
+	if errors.Is(err, database.ErrNotFound) || (err == nil && bytes.Equal(prev, msg)) {
+		return nil
+	}
+	if err != nil {
+		return appError(errCodeBusy, "reading the change signed last: %s", err)
+	}
+	prevChange, err := parseChange(prev)
+	if err != nil {
+		// Unreadable (a format this node no longer knows): it can't be told
+		// apart from a live change, so it holds until an operator clears it.
+		return appError(errCodeNotApproved, "the change this node signed last can't be read (%s); nothing else is signed until it's cleared", err)
+	}
+	done := false
+	var what string
+	switch p := prevChange.(type) {
+	case *message.RegisterL1Validator:
+		_, registered := current[p.ValidationID()]
+		expired := m.clock().After(time.Unix(int64(p.Expiry), 0).Add(expirySlack))
+		done = registered || expired
+		what = fmt.Sprintf("registration %s, until it's registered or expires at %s", p.ValidationID(), time.Unix(int64(p.Expiry), 0).UTC().Format(time.RFC3339))
+	case *message.L1ValidatorWeight:
+		v, ok := current[p.ValidationID]
+		done = !ok || v.MinNonce > p.Nonce
+		if w, same := change.(*message.L1ValidatorWeight); !done && same && w.ValidationID == p.ValidationID && w.Nonce == p.Nonce {
+			return nil // replaces it: the P-Chain takes only one change per nonce
+		}
+		what = fmt.Sprintf("weight %d for validation %s at nonce %d, until the P-Chain has it", p.Weight, p.ValidationID, p.Nonce)
+	}
+	if !done {
+		return appError(errCodeNotApproved, "this node signed another validator change that isn't on the P-Chain yet (%s): submit that one first, or replace a weight change at the same nonce", what)
+	}
+	if err := m.db.Delete(outstandingKey); err != nil {
+		return appError(errCodeBusy, "clearing the change signed last: %s", err)
+	}
+	return nil
+}
+
+// parseChange is the validator change in an unsigned Warp message.
+func parseChange(unsignedBytes []byte) (message.Payload, error) {
+	unsigned, err := warp.ParseUnsignedMessage(unsignedBytes)
+	if err != nil {
+		return nil, err
+	}
+	call, err := payload.ParseAddressedCall(unsigned.Payload)
+	if err != nil {
+		return nil, err
+	}
+	return message.Parse(call.Payload)
 }
 
 func (m *validatorManager) clock() time.Time {
@@ -305,63 +424,128 @@ func (m *validatorManager) clock() time.Time {
 	return time.Now()
 }
 
+// seat is one validation, as checkChange models it.
+type seat struct {
+	weight uint64
+	active bool   // funded: its BLS key signs for it
+	key    string // compressed BLS public key; Warp sums weight per key
+}
+
 // checkChange checks what an approved change does to the L1's current
-// validators (keyed by validation ID; only active ones count toward the
-// weight, as in the P-Chain's quorum).
+// validators. Warp counts every registered validation's weight in the total
+// (inactive ones too, with no key to sign), and sums weight per BLS key.
 func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*validators.GetCurrentValidatorOutput, approvals int) *common.AppError {
-	weights := map[ids.ID]uint64{}
+	seats := map[ids.ID]*seat{}
 	for id, v := range current {
-		if v.IsActive {
-			weights[id] = v.Weight
+		s := &seat{weight: v.Weight, active: v.IsActive}
+		if v.PublicKey != nil {
+			s.key = string(bls.PublicKeyToCompressedBytes(v.PublicKey))
 		}
+		seats[id] = s
 	}
-	var subject ids.ID
+	newcomer := false
 	switch c := change.(type) {
 	case *message.RegisterL1Validator:
-		subject = c.ValidationID()
-		if _, ok := current[subject]; ok {
-			return appError(errCodeNotManaged, "validation %s is already registered", subject)
+		id := c.ValidationID()
+		if _, ok := current[id]; ok {
+			return appError(errCodeNotManaged, "validation %s is already registered", id)
 		}
 		for _, v := range current {
 			if bytes.Equal(v.NodeID[:], c.NodeID) {
 				return appError(errCodeNotManaged, "%s already validates this L1", v.NodeID)
 			}
 		}
-		weights[subject] = c.Weight
+		key := string(c.BLSPublicKey[:])
+		for _, s := range seats {
+			if s.key == key {
+				return appError(errCodeNotManaged, "that BLS key is already registered for another validation: Warp would add their weight together")
+			}
+		}
+		// Until it's funded and online it can't sign: count it in the
+		// total, not in what can sign.
+		seats[id] = &seat{weight: c.Weight, key: key}
+		newcomer = true
 	case *message.L1ValidatorWeight:
-		subject = c.ValidationID
-		if _, ok := current[subject]; !ok {
-			return appError(errCodeNotManaged, "validation %s is not one of this L1's validators", subject)
+		s, ok := seats[c.ValidationID]
+		if !ok {
+			return appError(errCodeNotManaged, "validation %s is not one of this L1's validators", c.ValidationID)
 		}
 		if c.Weight == 0 {
-			delete(weights, subject)
-			if len(weights) == 0 {
-				return appError(errCodeNotManaged, "that would remove the L1's last active validator")
-			}
+			delete(seats, c.ValidationID)
 		} else {
-			weights[subject] = c.Weight
+			s.weight = c.Weight // a weight change doesn't fund or reactivate it
 		}
 	}
-	total, largest := new(big.Int), uint64(0)
-	for _, w := range weights {
-		total.Add(total, new(big.Int).SetUint64(w))
-		largest = max(largest, w)
+	total, signable := new(big.Int), new(big.Int)
+	byKey := map[string]*big.Int{}
+	active := 0
+	for id, s := range seats {
+		w := new(big.Int).SetUint64(s.weight)
+		total.Add(total, w)
+		if s.active {
+			signable.Add(signable, w)
+			active++
+		}
+		k := s.key
+		if k == "" {
+			k = "validation:" + id.String()
+		}
+		if byKey[k] == nil {
+			byKey[k] = new(big.Int)
+		}
+		byKey[k].Add(byKey[k], w)
 	}
-	// largest * 3 >= total: one validator could block the 67% quorum alone.
-	if new(big.Int).Mul(new(big.Int).SetUint64(largest), big.NewInt(3)).Cmp(total) >= 0 && approvals < p.admins.Len() {
-		return appError(errCodeNotApproved,
-			"after this change one validator holds %s of the L1's weight (a third or more), which needs all %d admins; %d approved",
-			share(largest, total), p.admins.Len(), approvals)
+	all := approvals >= p.admins.Len()
+	if active == 0 {
+		return appError(errCodeNotManaged, "that would leave the L1 with no active validator")
+	}
+	// Afterwards the validators that can sign today must still make 67% of
+	// the whole weight, or no later change could be signed. Growing from
+	// one validator can't meet that (the newcomer must come online first):
+	// only every admin together may count on it.
+	if !quorumOf(signable, total) && !(newcomer && all) {
+		msg := "after this change the validators able to sign hold %s of the L1's weight; the P-Chain needs 67%%, so no later change could be signed"
+		if newcomer {
+			msg += " until the new validator is funded and online: counting on that needs all %d admins"
+			return appError(errCodeNotApproved, msg, percent(signable, total), p.admins.Len())
+		}
+		return appError(errCodeNotApproved, msg, percent(signable, total))
+	}
+	// One key that could block the quorum alone: the rest wouldn't make 67%.
+	for _, w := range byKey {
+		if blocks(w, total) && !all {
+			return appError(errCodeNotApproved,
+				"after this change one validator holds %s of the L1's weight, enough to block the P-Chain's 67%% alone; that needs all %d admins, and %d approved",
+				percent(w, total), p.admins.Len(), approvals)
+		}
 	}
 	return nil
 }
 
-// share is w as a percentage of total, e.g. "33.3%".
-func share(w uint64, total *big.Int) string {
+// quorumOf is the P-Chain's check: signed*100 >= total*67.
+func quorumOf(signed, total *big.Int) bool {
+	lhs := new(big.Int).Mul(signed, big.NewInt(100))
+	rhs := new(big.Int).Mul(total, big.NewInt(67))
+	return lhs.Cmp(rhs) >= 0
+}
+
+// blocks: without w, the rest of total can't make the P-Chain's quorum.
+func blocks(w, total *big.Int) bool {
+	return !quorumOf(new(big.Int).Sub(total, w), total)
+}
+
+// Quorum, Blocks and Percent are for the admin tools, so they show exactly
+// what the validators will decide.
+func Quorum(signed, total *big.Int) bool { return quorumOf(signed, total) }
+func Blocks(w, total *big.Int) bool      { return blocks(w, total) }
+func Percent(w, total *big.Int) string   { return percent(w, total) }
+
+// percent is w as a percentage of total, e.g. "33.3%".
+func percent(w, total *big.Int) string {
 	if total.Sign() == 0 {
 		return "100%"
 	}
-	r := new(big.Rat).SetFrac(new(big.Int).Mul(new(big.Int).SetUint64(w), big.NewInt(100)), total)
+	r := new(big.Rat).SetFrac(new(big.Int).Mul(w, big.NewInt(100)), total)
 	f, _ := r.Float64()
 	return fmt.Sprintf("%.1f%%", f)
 }
@@ -414,9 +598,6 @@ func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, just
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("not a Warp message: %w", err)
 	}
-	if appErr := m.Verify(ctx, unsigned, justification); appErr != nil {
-		return nil, nil, nil, errors.New(appErr.Message)
-	}
 	snowCtx := m.vm.ctx
 	// The P-Chain checks the signatures against the L1's validators at the
 	// P-Chain height its block proposer picks, which lags the tip (the
@@ -445,6 +626,11 @@ func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, just
 		}
 	}
 
+	// Only now, when this node will sign and ask the others to: Verify
+	// records the change as this node's outstanding one.
+	if appErr := m.Verify(ctx, unsigned, justification); appErr != nil {
+		return nil, nil, nil, errors.New(appErr.Message)
+	}
 	need := requiredWeight(vdrs.TotalWeight)
 	signed, weight, err := m.collect(ctx, unsigned, justification, vdrs, need)
 	if err != nil {
@@ -577,11 +763,9 @@ func requiredWeight(total uint64) uint64 {
 	return n.Uint64()
 }
 
-// quorum is the P-Chain's check: signed*100 >= total*67.
+// quorum is quorumOf for a uint64 total.
 func quorum(signed *big.Int, total uint64) bool {
-	lhs := new(big.Int).Mul(signed, big.NewInt(100))
-	rhs := new(big.Int).Mul(new(big.Int).SetUint64(total), big.NewInt(67))
-	return lhs.Cmp(rhs) >= 0
+	return quorumOf(signed, new(big.Int).SetUint64(total))
 }
 
 // errValidatorSetSettling: signatures made now might be checked against
@@ -611,9 +795,10 @@ func containsNode(nodeIDs []ids.NodeID, want ids.NodeID) bool {
 
 // newValidatorManager registers the ACP-118 signature handler on the VM's
 // p2p network and a client for collecting signatures.
-func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy) (*validatorManager, error) {
-	m := &validatorManager{vm: vm, policy: policy, limiter: newRateLimiter(verifyRate, verifyBurst)}
-	if err := network.AddHandler(acp118.HandlerID, acp118.NewHandler(m, vm.ctx.WarpSigner)); err != nil {
+func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy, db database.Database) (*validatorManager, error) {
+	m := &validatorManager{vm: vm, policy: policy, db: db}
+	handler := newLimitedHandler(acp118.NewHandler(m, vm.ctx.WarpSigner), m.clock)
+	if err := network.AddHandler(acp118.HandlerID, handler); err != nil {
 		return nil, fmt.Errorf("registering the signature handler: %w", err)
 	}
 	m.client = network.NewClient(acp118.HandlerID, vm.p2pValidators)

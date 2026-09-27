@@ -72,14 +72,22 @@ func TestProposalApprovals(t *testing.T) {
 		t.Fatalf("a second approval by the same admin: %v", err)
 	}
 
-	// The next admin reads the file; its labels don't count, only the message.
+	// The next admin reads the file; its labels don't count, only the message
+	// and whoever the signatures recover to.
 	p.NodeID, p.Weight, p.Summary = ids.GenerateTestNodeID().String(), 1_000_000, "something harmless"
+	p.ApprovedBy = []string{"P-local1fakefakefake", "P-local1another"}
 	read, rc, err := readProposal(writeProposal(t, dir, p), netID, chainID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if read.NodeID != nodeID.String() || read.Weight != 100 || !strings.Contains(read.Summary, nodeID.String()) {
 		t.Fatalf("labels not recomputed from the message: %+v", read)
+	}
+	if len(read.ApprovedBy) != 1 || strings.Contains(read.ApprovedBy[0], "fake") {
+		t.Fatalf("ApprovedBy taken from the file, not the signatures: %v", read.ApprovedBy)
+	}
+	if !strings.Contains(read.Summary, "can be disabled by 1 of [") || !strings.Contains(read.Summary, "BLS key 0x") {
+		t.Fatalf("summary leaves out the disable owner or BLS key: %s", read.Summary)
 	}
 	if err := read.addApproval(rc.unsigned, netID, admin2); err != nil {
 		t.Fatal(err)

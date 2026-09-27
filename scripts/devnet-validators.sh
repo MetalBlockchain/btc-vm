@@ -178,37 +178,38 @@ settling() {
   done
   fail "the validator set never settled"
 }
-# approvals PROPOSAL OUT ADMIN...: the first admin's approval is already in
-# PROPOSAL; each further admin adds theirs, the last submitting via node 1.
+# approvals PROPOSAL ADMIN...: each admin adds an approval to PROPOSAL (the
+# first admin's is already in it).
 approvals() {
-  local proposal=$1 out=$2 a last
-  shift 2
-  last=${*: -1}
+  local proposal=$1 a
+  shift
   for a in "$@"; do
-    if [[ $a == "$last" ]]; then
-      "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$proposal" -key "$DIR/admin$a.json" -yes \
-        -payer-key "$DIR/ewoq.json" -rpc-pass-file "$DIR/rpc-password" >"$out" || return 1
-    else
-      "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$proposal" -key "$DIR/admin$a.json" -yes \
-        >"$proposal.next" && mv "$proposal.next" "$proposal" || return 1
-    fi
+    "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$proposal" -key "$DIR/admin$a.json" -yes \
+      >"$proposal.next" && mv "$proposal.next" "$proposal" || return 1
   done
 }
-# approve_and_register NODE ADMIN...: admin 1 starts, the others follow.
-approve_and_register() {
-  local i=$1
-  shift
-  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request$i.json" -key "$DIR/admin1.json" -yes \
-    >"$DIR/proposal$i.json" || return 1
-  approvals "$DIR/proposal$i.json" "$DIR/registration$i.json" "$@" || return 1
-  "$BIN/btcvm-l1" register -registration "$DIR/registration$i.json" -key "$DIR/ewoq.json" \
-    -uri "$(uri "$i")" -balance 1 >"$DIR/registered$i.json"
+# submit PROPOSAL OUT: node 1 collects the validators' signatures; a
+# registration comes back for the candidate, a weight change is issued.
+# Retry this, never a new proposal: validators that signed hold that exact
+# change until it's on the P-Chain or expires.
+submit() {
+  "$BIN/btcvm-l1" submit "${L1[@]}" -node-uri "$(uri 1)" -proposal "$1" -payer-key "$DIR/ewoq.json" \
+    -rpc-pass-file "$DIR/rpc-password" >"$2"
 }
-add_validator() { # NODE ADMIN...
+submit_and_register() { # NODE
+  submit "$DIR/proposal$1.json" "$DIR/registration$1.json" || return 1
+  "$BIN/btcvm-l1" register -registration "$DIR/registration$1.json" -key "$DIR/ewoq.json" \
+    -uri "$(uri "$1")" -balance 1 >"$DIR/registered$1.json"
+}
+add_validator() { # NODE ADMIN...: admin 1 starts the proposal, the others follow
   local i=$1 id
+  shift
   "$BIN/btcvm-l1" request -node-uri "$(uri "$i")" -owner "$EWOQ_P" >"$DIR/request$i.json"
   id=$(jq -r .nodeID "$DIR/request$i.json")
-  settling approve_and_register "$@"
+  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request$i.json" -key "$DIR/admin1.json" -yes \
+    >"$DIR/proposal$i.json"
+  approvals "$DIR/proposal$i.json" "$@"
+  settling submit_and_register "$i"
   wait_for 60 "node $i on the validator list" has_validator "$id"
   ok "node $i ($id) is a validator: $(jq -r .txID "$DIR/registered$i.json")"
 }
@@ -217,11 +218,12 @@ log "Add validators"
 "$BIN/btcvm-l1" request -node-uri "$(uri 2)" -owner "$EWOQ_P" >"$DIR/request2.json"
 "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request2.json" -key "$DIR/admin1.json" -yes \
   >"$DIR/proposal2-two.json"
-if approvals "$DIR/proposal2-two.json" "$DIR/out2.json" 2 2>"$DIR/err2.txt"; then
+approvals "$DIR/proposal2-two.json" 2
+if submit "$DIR/proposal2-two.json" "$DIR/out2.json" 2>"$DIR/err2.txt"; then
   fail "two admins added a second validator (50% of the weight)"
 fi
 grep -q "needs all 3 admins" "$DIR/err2.txt" || fail "unexpected refusal: $(cat "$DIR/err2.txt")"
-ok "two admins can't add a validator that would hold 50%: $(grep -o 'one validator holds [^,]*' "$DIR/err2.txt" | head -1)"
+ok "two admins can't add a validator that would hold 50%: $(grep -o 'after this change[^;:]*' "$DIR/err2.txt" | head -1)"
 add_validator 2 2 3
 add_validator 3 2 3
 # 3 -> 4 (25% each): two admins are enough.
@@ -294,7 +296,8 @@ N3=$(jq -r .validationID "$DIR/registration3.json")
 remove_node3() { # ADMIN...: admin 1 starts, the others follow
   "$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N3" -key "$DIR/admin1.json" -yes \
     >"$DIR/remove3.json" || return 1
-  approvals "$DIR/remove3.json" "$DIR/removed3.json" "$@"
+  approvals "$DIR/remove3.json" "$@" || return 1
+  settling submit "$DIR/remove3.json" "$DIR/removed3.json"
 }
 # 4 -> 3 leaves 33.3% each: two admins aren't enough.
 if remove_node3 2 2>"$DIR/err3.txt"; then
@@ -302,7 +305,7 @@ if remove_node3 2 2>"$DIR/err3.txt"; then
 fi
 grep -q "needs all 3 admins" "$DIR/err3.txt" || fail "unexpected refusal: $(cat "$DIR/err3.txt")"
 ok "two admins can't leave a validator with a third of the weight"
-settling remove_node3 2 3
+remove_node3 2 3
 N3_ID=$(jq -r .nodeID "$DIR/registration3.json")
 not_validator() { ! has_validator "$1"; }
 wait_for 60 "node 3 off the validator list" not_validator "$N3_ID"
@@ -341,11 +344,12 @@ fi
 ok "an admin can't approve twice"
 # 3 validators at 100 plus one at 300: 50%. Two admins aren't enough.
 "$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request5.json" -key "$DIR/admin1.json" -weight 300 -yes >"$DIR/heavy5.json"
-if approvals "$DIR/heavy5.json" "$DIR/out5.json" 2 2>"$DIR/err6.txt"; then
+approvals "$DIR/heavy5.json" 2
+if submit "$DIR/heavy5.json" "$DIR/out5.json" 2>"$DIR/err6.txt"; then
   fail "two admins added a validator with 50% of the weight"
 fi
 grep -q "needs all 3 admins" "$DIR/err6.txt" || fail "unexpected refusal: $(cat "$DIR/err6.txt")"
-ok "a heavy validator needs every admin: $(grep -o 'one validator holds [^,]*' "$DIR/err6.txt" | head -1)"
+ok "a heavy validator needs every admin: $(grep -o 'after this change[^;:]*' "$DIR/err6.txt" | head -1)"
 echo wrong >"$DIR/wrong-password"
 if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/proposal5.json" -yes \
   -key "$DIR/admin2.json" -rpc-pass-file "$DIR/wrong-password" >/dev/null 2>"$DIR/err5.txt"; then
@@ -353,5 +357,24 @@ if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/propo
 fi
 ok "signing endpoint needs the RPC login"
 [[ $(validator_count) == 3 ]] || fail "validator count changed"
+
+# --- 7. One change at a time ------------------------------------------------------------
+log "Validators sign one change at a time"
+# Node 5's registration, approved and signed but not submitted: until it's on
+# the P-Chain or expires, the validators sign no other change, so changes
+# approved one by one can't be gathered and submitted together.
+"$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request5.json" -key "$DIR/admin1.json" -yes -offline >"$DIR/pending5.json"
+approvals "$DIR/pending5.json" 2
+submit "$DIR/pending5.json" "$DIR/signed5.json" || fail "node 5's registration wasn't signed"
+N4=$(jq -r .validationID "$DIR/registration4.json")
+"$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N4" -key "$DIR/admin1.json" -yes >"$DIR/remove4.json"
+approvals "$DIR/remove4.json" 2 3
+if submit "$DIR/remove4.json" "$DIR/removed4.json" 2>"$DIR/err7.txt"; then
+  fail "a second change was signed while node 5's registration was outstanding"
+fi
+grep -q "isn't on the P-Chain yet" "$DIR/err7.txt" || fail "unexpected refusal: $(cat "$DIR/err7.txt")"
+ok "a second change waits for the first: $(grep -o "this node signed another validator change[^(]*" "$DIR/err7.txt" | head -1)"
+submit "$DIR/pending5.json" "$DIR/signed5-again.json" || fail "the same change wasn't signed again"
+ok "the outstanding change itself can be signed again"
 
 log "PASS: validators added, took turns building blocks, were paid their fees, and one was removed"

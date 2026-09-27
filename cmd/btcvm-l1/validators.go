@@ -48,6 +48,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"os"
 	"sort"
@@ -253,16 +254,17 @@ func (c *change) label(p *proposal) error {
 		expiry := time.Unix(int64(c.reg.Expiry), 0).UTC()
 		p.Change, p.NodeID, p.ValidationID, p.Weight = "register", nodeID.String(), c.reg.ValidationID().String(), c.reg.Weight
 		p.Expiry = expiry.Format(time.RFC3339)
-		var owners []string
-		for _, a := range c.reg.RemainingBalanceOwner.Addresses {
-			addr, err := address.Format("P", constants.GetHRP(c.unsigned.NetworkID), a.Bytes())
-			if err != nil {
-				return err
-			}
-			owners = append(owners, addr)
+		balanceOwner, err := ownerText(c.unsigned.NetworkID, c.reg.RemainingBalanceOwner)
+		if err != nil {
+			return err
 		}
-		p.Summary = fmt.Sprintf("register %s on subnet %s with weight %d; what's left of its balance returns to %s; valid until %s",
-			nodeID, c.reg.SubnetID, c.reg.Weight, strings.Join(owners, ", "), p.Expiry)
+		disableOwner, err := ownerText(c.unsigned.NetworkID, c.reg.DisableOwner)
+		if err != nil {
+			return err
+		}
+		p.Summary = fmt.Sprintf("register %s (BLS key %s) on subnet %s with weight %d; what's left of its balance returns to %s; "+
+			"it can be disabled by %s; valid until %s",
+			nodeID, hexBytes(c.reg.BLSPublicKey[:]), c.reg.SubnetID, c.reg.Weight, balanceOwner, disableOwner, p.Expiry)
 	default:
 		p.Change, p.ValidationID, p.Weight = "set-weight", c.weight.ValidationID.String(), c.weight.Weight
 		p.NodeID, p.Expiry, p.BLSProofOfPossession = "", "", ""
@@ -273,6 +275,19 @@ func (c *change) label(p *proposal) error {
 		p.Summary = fmt.Sprintf("%s (nonce %d)", verb, c.weight.Nonce)
 	}
 	return nil
+}
+
+// ownerText is a P-Chain owner as "N of [addresses]".
+func ownerText(networkID uint32, o message.PChainOwner) (string, error) {
+	var addrs []string
+	for _, a := range o.Addresses {
+		addr, err := address.Format("P", constants.GetHRP(networkID), a.Bytes())
+		if err != nil {
+			return "", err
+		}
+		addrs = append(addrs, addr)
+	}
+	return fmt.Sprintf("%d of [%s]", o.Threshold, strings.Join(addrs, ", ")), nil
 }
 
 // check refuses a change nobody could still make: a registration past its
@@ -362,8 +377,18 @@ func readProposal(path string, networkID uint32, chainID ids.ID) (*proposal, *ch
 		return nil, nil, err
 	}
 	p.setDeadline(time.Unix(int64(p.Deadline), 0))
-	if _, _, err := p.approvals(c.unsigned); err != nil {
+	_, who, err := p.approvals(c.unsigned)
+	if err != nil {
 		return nil, nil, err
+	}
+	// Who approved is whoever the signatures recover to, never the file's say.
+	p.ApprovedBy = nil
+	for _, w := range who {
+		addr, err := address.Format("P", constants.GetHRP(networkID), w.Bytes())
+		if err != nil {
+			return nil, nil, err
+		}
+		p.ApprovedBy = append(p.ApprovedBy, addr)
 	}
 	return &p, c, nil
 }
@@ -487,6 +512,7 @@ func cmdApprove(args []string) error {
 	weight := fs.Uint64("weight", 100, "with -request: the new validator's weight (the first validator has 100)")
 	valid := fs.Duration("valid-for", 23*time.Hour, "with -request: how long the admins and the candidate have to finish (at most 24h, which the P-Chain counts from when it is registered)")
 	yes := fs.Bool("yes", false, "approve without asking")
+	offline := fs.Bool("offline", false, "approve without the share preview (no P-Chain access)")
 	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
 	if (*requestPath == "") == (*proposalPath == "") || *keyPath == "" {
@@ -526,7 +552,7 @@ func cmdApprove(args []string) error {
 	if err := c.check(p); err != nil {
 		return err
 	}
-	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes); err != nil {
+	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes, *offline); err != nil {
 		return err
 	}
 	if err := p.addApproval(c.unsigned, networkID, *keyPath); err != nil {
@@ -583,15 +609,18 @@ func registrationFor(requestPath string, subnetID ids.ID, weight uint64, expiry 
 
 // confirm shows an admin what they're approving, from the message itself,
 // and what it does to the validators' shares; then asks, unless yes.
-func confirm(p *proposal, c *change, nodeURI string, subnetID ids.ID, yes bool) error {
-	fmt.Fprintf(os.Stderr, "\nThe change:     %s\n", p.Summary)
+func confirm(p *proposal, c *change, nodeURI string, subnetID ids.ID, yes, offline bool) error {
+	fmt.Fprintf(os.Stderr, "\nThe change:      %s\n", p.Summary)
 	fmt.Fprintf(os.Stderr, "Approvals until: %s\n", p.DeadlineUTC)
 	if len(p.ApprovedBy) > 0 {
-		fmt.Fprintf(os.Stderr, "Approved by:     %s\n", strings.Join(p.ApprovedBy, ", "))
+		fmt.Fprintf(os.Stderr, "Approved by:     %s (recovered from their signatures)\n", strings.Join(p.ApprovedBy, ", "))
 	}
-	if lines, err := shareReport(c, nodeURI, subnetID); err != nil {
-		fmt.Fprintf(os.Stderr, "(couldn't read the L1's validators from %s: %s)\n", nodeURI, err)
-	} else {
+	switch lines, err := shareReport(c, nodeURI, subnetID, offline); {
+	case offline:
+		fmt.Fprint(os.Stderr, "\nOffline: no share preview. The validators check the shares themselves before they sign.\n")
+	case err != nil:
+		return fmt.Errorf("reading the L1's validators from %s for the share preview: %w (-offline approves without it)", nodeURI, err)
+	default:
 		fmt.Fprint(os.Stderr, lines)
 	}
 	if yes {
@@ -605,17 +634,21 @@ func confirm(p *proposal, c *change, nodeURI string, subnetID ids.ID, yes bool) 
 	return nil
 }
 
-// shareReport is the L1's validators before and after the change, and how
-// many of the largest could be offline with the rest still at 67%.
-func shareReport(c *change, nodeURI string, subnetID ids.ID) (string, error) {
+// shareReport is the L1's validators before and after the change, as the
+// validators will judge it (vm checkChange): every registered weight counts
+// in the total, only active validators can sign.
+func shareReport(c *change, nodeURI string, subnetID ids.ID, offline bool) (string, error) {
+	if offline {
+		return "", nil
+	}
 	vdrs, err := platformvm.NewClient(nodeURI).GetCurrentValidators(context.Background(), subnetID, nil)
 	if err != nil {
 		return "", err
 	}
 	type row struct {
-		id     string
-		before uint64
-		after  uint64
+		id            string
+		before, after *big.Int
+		active        bool
 	}
 	var rows []row
 	var subject string
@@ -629,55 +662,65 @@ func shareReport(c *change, nodeURI string, subnetID ids.ID) (string, error) {
 		if v.ValidationID == nil {
 			continue
 		}
-		r := row{id: v.NodeID.String(), before: v.Weight, after: v.Weight}
+		r := row{id: v.NodeID.String(), before: new(big.Int).SetUint64(v.Weight), after: new(big.Int).SetUint64(v.Weight),
+			active: v.Balance != nil && *v.Balance > 0}
 		if c.weight != nil && v.ValidationID.String() == subject {
 			found = true
-			r.after = c.weight.Weight
+			r.after = new(big.Int).SetUint64(c.weight.Weight)
+		}
+		if !r.active {
+			r.id += " (inactive)"
 		}
 		rows = append(rows, r)
 	}
 	if c.reg != nil {
 		nodeID, _ := ids.ToNodeID(c.reg.NodeID)
-		rows = append(rows, row{id: nodeID.String() + " (new)", after: c.reg.Weight})
+		rows = append(rows, row{id: nodeID.String() + " (new)", before: new(big.Int), after: new(big.Int).SetUint64(c.reg.Weight)})
 	} else if !found {
 		return "", fmt.Errorf("validation %s is not one of this L1's current validators", subject)
 	}
-	var before, after uint64
-	var weights []uint64
+	before, after, signable := new(big.Int), new(big.Int), new(big.Int)
+	var weights []*big.Int
 	for _, r := range rows {
-		before += r.before
-		after += r.after
-		if r.after > 0 {
+		before.Add(before, r.before)
+		after.Add(after, r.after)
+		if r.after.Sign() > 0 {
 			weights = append(weights, r.after)
+			if r.active {
+				signable.Add(signable, r.after)
+			}
 		}
 	}
-	pct := func(w, total uint64) string {
-		if total == 0 {
+	pct := func(w, total *big.Int) string {
+		if total.Sign() == 0 {
 			return "-"
 		}
-		return fmt.Sprintf("%.1f%%", float64(w)*100/float64(total))
+		return vm.Percent(w, total)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n%-44s %14s %14s\n", "Validator", "share before", "share after")
+	fmt.Fprintf(&b, "\n%-56s %13s %13s\n", "Validator", "share before", "share after")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "%-44s %14s %14s\n", r.id, pct(r.before, before), pct(r.after, after))
+		fmt.Fprintf(&b, "%-56s %13s %13s\n", r.id, pct(r.before, before), pct(r.after, after))
 	}
-	sort.Slice(weights, func(i, j int) bool { return weights[i] > weights[j] })
-	offline, left := 0, after
+	fmt.Fprintf(&b, "Afterwards the validators able to sign now hold %s of the weight (the P-Chain needs 67%%).\n", pct(signable, after))
+	sort.Slice(weights, func(i, j int) bool { return weights[i].Cmp(weights[j]) > 0 })
+	tolerate := 0
+	left := new(big.Int).Set(after)
 	for _, w := range weights {
-		if (left-w)*100 < after*67 {
+		rest := new(big.Int).Sub(left, w)
+		if !vm.Quorum(rest, after) {
 			break
 		}
-		offline++
-		left -= w
+		tolerate++
+		left = rest
 	}
-	fmt.Fprintf(&b, "After it, %d validator(s) can be offline and the rest still reach the 67%% the P-Chain needs.\n", offline)
-	if offline == 0 {
+	fmt.Fprintf(&b, "%d validator(s) could be offline and the rest still reach 67%%.\n", tolerate)
+	if tolerate == 0 {
 		b.WriteString("WARNING: with any one validator offline, the L1's validators can't be changed again until it's back.\n")
 	}
 	for _, w := range weights {
-		if w*3 >= after {
-			b.WriteString("A validator would hold a third or more of the weight: the validators sign this only with every admin's approval.\n")
+		if vm.Blocks(w, after) {
+			b.WriteString("One validator could block the 67% alone: the validators sign this only with every admin's approval.\n")
 			break
 		}
 	}
@@ -722,7 +765,9 @@ func cmdRegister(args []string) error {
 	keyPath := fs.String("key", "", "the P-Chain key that pays the balance")
 	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
 	balance := fs.Float64("balance", 1, "METAL for the validator's continuous P-Chain fee")
-	otherNode := fs.Bool("other-node", false, "register it even though it isn't for the node at -uri")
+	otherNode := fs.Bool("other-node", false, "register it though it isn't for the node at -uri (then -candidate-uri is the candidate's node)")
+	candidateURI := fs.String("candidate-uri", "", "with -other-node: the candidate node's API, to check it has bootstrapped")
+	skipBootstrap := fs.Bool("skip-bootstrap-check", false, "with -other-node and no -candidate-uri: register without checking the candidate has bootstrapped")
 	lowBalance := fs.Bool("low-balance", false, "allow a starting balance under 1 METAL (under a month of fees)")
 	_ = fs.Parse(args)
 	if *regPath == "" || *keyPath == "" {
@@ -751,13 +796,17 @@ func cmdRegister(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "registering %s (weight %d); what's left of the balance goes to %v\n",
 		nodeID, inner.Weight, inner.RemainingBalanceOwner.Addresses)
-	if !*otherNode {
-		mine, pop, err := info.NewClient(*uri).GetNodeID(context.Background())
+	candidate := *uri
+	if *otherNode {
+		candidate = *candidateURI
+	}
+	if candidate != "" {
+		mine, pop, err := info.NewClient(candidate).GetNodeID(context.Background())
 		if err != nil {
-			return fmt.Errorf("reading the node at -uri (to check the registration is for it): %w", err)
+			return fmt.Errorf("reading the candidate node at %s (to check the registration is for it): %w", candidate, err)
 		}
 		if mine != nodeID || pop == nil || pop.PublicKey != inner.BLSPublicKey {
-			return fmt.Errorf("this registration is for %s, not the node at -uri (%s); -other-node registers it anyway", nodeID, mine)
+			return fmt.Errorf("this registration is for %s, not the node at %s (%s)", nodeID, candidate, mine)
 		}
 		// A validator counts from the moment it's registered: it must
 		// already be caught up on the P-Chain and the L1, ready to sign.
@@ -766,14 +815,18 @@ func cmdRegister(args []string) error {
 			return err
 		}
 		for _, chain := range []string{"P", msg.UnsignedMessage.SourceChainID.String()} {
-			done, err := info.NewClient(*uri).IsBootstrapped(context.Background(), chain)
+			done, err := info.NewClient(candidate).IsBootstrapped(context.Background(), chain)
 			if err != nil {
-				return fmt.Errorf("asking the node whether it has bootstrapped %s: %w", chain, err)
+				return fmt.Errorf("asking the candidate node whether it has bootstrapped %s: %w", chain, err)
 			}
 			if !done {
-				return fmt.Errorf("the node hasn't finished bootstrapping %s; register once it has (sudo ./setup.sh --status)", chain)
+				return fmt.Errorf("the candidate node hasn't finished bootstrapping %s; register once it has (sudo ./setup.sh --status)", chain)
 			}
 		}
+	} else if !*skipBootstrap {
+		return errors.New("-other-node needs -candidate-uri (the candidate's node, to check it's ready), or -skip-bootstrap-check")
+	} else {
+		fmt.Fprintln(os.Stderr, "WARNING: not checking the candidate node has bootstrapped; it counts as a validator from the moment it's registered")
 	}
 	popBytes, err := unhex(reg.BLSProofOfPossession, "blsProofOfPossession")
 	if err != nil {
@@ -848,7 +901,7 @@ func cmdRemove(args []string) error {
 		return err
 	}
 	p.setDeadline(time.Now().Add(*valid))
-	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes); err != nil {
+	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes, false); err != nil {
 		return err
 	}
 	if err := p.addApproval(unsigned, networkID, *keyPath); err != nil {
@@ -894,10 +947,31 @@ func cmdDisable(args []string) error {
 	validationFlag := fs.String("validation-id", "", "the validator's validation ID")
 	keyPath := fs.String("key", "", "the validator's owner key (the -owner of its request)")
 	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
+	last := fs.Bool("last", false, "disable it even if it's the L1's last active validator (the L1 then stops)")
 	_ = fs.Parse(args)
 	validationID, err := ids.FromString(*validationFlag)
 	if err != nil {
 		return fmt.Errorf("-validation-id: %w", err)
+	}
+	if !*last {
+		pc := platformvm.NewClient(*uri)
+		v, _, err := pc.GetL1Validator(context.Background(), validationID)
+		if err != nil {
+			return fmt.Errorf("reading the validator: %w", err)
+		}
+		vdrs, err := pc.GetCurrentValidators(context.Background(), v.SubnetID, nil)
+		if err != nil {
+			return fmt.Errorf("reading the L1's validators: %w", err)
+		}
+		others := 0
+		for _, o := range vdrs {
+			if o.ValidationID != nil && *o.ValidationID != validationID && o.Balance != nil && *o.Balance > 0 {
+				others++
+			}
+		}
+		if others == 0 {
+			return errors.New("this is the L1's last active validator: disabling it stops the L1 (-last does it anyway)")
+		}
 	}
 	wallet, err := pWallet(*uri, *keyPath)
 	if err != nil {
