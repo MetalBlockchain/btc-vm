@@ -55,6 +55,9 @@ package main
 // older change than the one it really signed. Each operator's -owner key
 // is its own: the owner can disable the validator.
 //
+// The runbook, growing the set and recovering from a lost key, a split or
+// disables: docs/VALIDATORS.md.
+//
 // Nothing secret changes hands: a request holds the candidate's NodeID and
 // BLS public key and proof of possession; a proposal holds the unsigned
 // change and the admins' approvals; a registration holds the signed Warp
@@ -220,9 +223,10 @@ type proposal struct {
 	// validators refuse approvals past it.
 	Deadline    uint64 `json:"deadline"`
 	DeadlineUTC string `json:"deadlineUTC"`
-	// Replaces whatever change the validators hold (every admin must
-	// approve): the way out if validators hold different changes.
-	ReplaceHeld bool     `json:"replaceHeld,omitempty"`
+	// Replaces the held changes named (their HeldHash, from each validator's
+	// "held"; every admin must approve): the way out if validators hold
+	// different changes.
+	ReplaceHeld []string `json:"replaceHeld,omitempty"`
 	Approvals   []string `json:"approvals"`
 	ApprovedBy  []string `json:"approvedBy"`
 	// For a registration: what the candidate needs to register.
@@ -327,13 +331,41 @@ func (c *change) check(p *proposal) error {
 	return nil
 }
 
-// flags are the approval flags every admin signs with.
-func (p *proposal) flags() byte {
-	if p.ReplaceHeld {
-		return vm.FlagReplaceHeld
+// approval is what every admin signs with the message.
+func (p *proposal) approval() (vm.Approval, error) {
+	a := vm.Approval{Deadline: p.Deadline}
+	if len(p.ReplaceHeld) > 0 {
+		a.Flags = vm.FlagReplaceHeld
+		if len(p.ReplaceHeld) > vm.MaxReplaced {
+			return a, fmt.Errorf("a replacement names at most %d held changes", vm.MaxReplaced)
+		}
+		for _, h := range p.ReplaceHeld {
+			b, err := unhex(h, "replaceHeld")
+			if err != nil || len(b) != 32 {
+				return a, fmt.Errorf("replaceHeld %q isn't a 32-byte held-change hash", h)
+			}
+			var x [32]byte
+			copy(x[:], b)
+			a.Replaces = append(a.Replaces, x)
+		}
 	}
-	return 0
+	return a, nil
 }
+
+// parseReplaceHeld is -replace-held's comma-separated hashes.
+func parseReplaceHeld(list string) []string {
+	var out []string
+	for _, h := range strings.Split(list, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// replaceLife caps a replacement's approvals: it names the changes held
+// now, and shouldn't be kept.
+const replaceLife = time.Hour
 
 // setDeadline fixes the time every approval of the proposal is good until.
 func (p *proposal) setDeadline(t time.Time) {
@@ -343,7 +375,11 @@ func (p *proposal) setDeadline(t time.Time) {
 
 // approvals decodes a proposal's approvals and who gave each.
 func (p *proposal) approvals(unsigned *warp.UnsignedMessage) ([][]byte, []ids.ShortID, error) {
-	hash := vm.ApprovalHash(unsigned.Bytes(), p.flags(), p.Deadline)
+	a, err := p.approval()
+	if err != nil {
+		return nil, nil, err
+	}
+	hash := vm.ApprovalHash(unsigned.Bytes(), a)
 	var sigs [][]byte
 	var who []ids.ShortID
 	for i, a := range p.Approvals {
@@ -375,7 +411,11 @@ func (p *proposal) addApproval(unsigned *warp.UnsignedMessage, networkID uint32,
 			return errors.New("this key has already approved this change")
 		}
 	}
-	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes(), p.flags(), p.Deadline))
+	a, err := p.approval()
+	if err != nil {
+		return err
+	}
+	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes(), a))
 	if err != nil {
 		return err
 	}
@@ -428,12 +468,18 @@ func readProposal(path string, networkID uint32, chainID ids.ID) (*proposal, *ch
 
 // collect has the validator node at nodeURI collect the L1 validators'
 // signatures on an approved change.
-func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, flags byte, deadline uint64, approvals [][]byte) (*warp.Message, error) {
+//
+// With requireSigner set, that validator's own signature must be among them.
+func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, a vm.Approval, approvals [][]byte, requireSigner ids.NodeID) (*warp.Message, error) {
 	pass, err := os.ReadFile(rpcPassFile)
 	if err != nil {
 		return nil, fmt.Errorf("-rpc-pass-file: %w", err)
 	}
-	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(vm.EncodeJustification(flags, deadline, approvals))})
+	request := map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(vm.EncodeJustification(a, approvals))}
+	if requireSigner != ids.EmptyNodeID {
+		request["requireSigner"] = requireSigner.String()
+	}
+	body, _ := json.Marshal(request)
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(nodeURI, "/")+"/ext/bc/"+chainID.String()+"/validators", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -449,7 +495,10 @@ func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsign
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("the validators didn't sign: %s", strings.TrimSpace(string(raw)))
 	}
-	var reply struct{ SignedMessage, SignedWeight, TotalWeight string }
+	var reply struct {
+		SignedMessage, SignedWeight, TotalWeight string
+		Signers                                  []string
+	}
 	if err := json.Unmarshal(raw, &reply); err != nil {
 		return nil, err
 	}
@@ -464,6 +513,15 @@ func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsign
 	// What came back must be exactly what the admins approved.
 	if !bytes.Equal(msg.UnsignedMessage.Bytes(), unsigned.Bytes()) {
 		return nil, errors.New("the node returned a signed message that isn't the approved one; not using it")
+	}
+	if requireSigner != ids.EmptyNodeID {
+		found := false
+		for _, n := range reply.Signers {
+			found = found || n == requireSigner.String()
+		}
+		if !found {
+			return nil, fmt.Errorf("%s isn't among the signers: not raising a validator that hasn't shown it signs", requireSigner)
+		}
 	}
 	fmt.Fprintf(os.Stderr, "signed by weight %s of %s\n", reply.SignedWeight, reply.TotalWeight)
 	return msg, nil
@@ -500,7 +558,23 @@ func submit(p *proposal, c *change, nodeURI string, chainID ids.ID, f submitFlag
 	if c.weight != nil && *f.payerPath == "" {
 		return errors.New("-payer-key is needed to issue a weight change")
 	}
-	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, p.flags(), p.Deadline, sigs)
+	a, err := p.approval()
+	if err != nil {
+		return err
+	}
+	// A raise needs the validator being raised to sign it too: proof it's
+	// online and signing, before more of the weight depends on it.
+	require := ids.EmptyNodeID
+	if c.weight != nil && c.weight.Weight > 0 {
+		v, _, err := platformvm.NewClient(nodeURI).GetL1Validator(context.Background(), c.weight.ValidationID)
+		if err != nil {
+			return fmt.Errorf("reading the validator: %w", err)
+		}
+		if c.weight.Weight > v.Weight {
+			require = v.NodeID
+		}
+	}
+	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, a, sigs, require)
 	if err != nil {
 		return err
 	}
@@ -546,13 +620,13 @@ func cmdApprove(args []string) error {
 	valid := fs.Duration("valid-for", 23*time.Hour, "with -request: how long the admins and the candidate have to finish (at most 24h, which the P-Chain counts from when it is registered)")
 	yes := fs.Bool("yes", false, "approve without asking")
 	offline := fs.Bool("offline", false, "approve without the share preview (no P-Chain access)")
-	replaceHeld := fs.Bool("replace-held", false, "with -request: the change replaces whatever change the validators hold (only if every admin approves; for validators stuck holding different changes)")
+	replaceHeld := fs.String("replace-held", "", "with -request: HASH[,HASH...] of the held changes (from held) this one replaces; every admin must approve. For validators stuck holding different changes")
 	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
 	if (*requestPath == "") == (*proposalPath == "") || *keyPath == "" {
 		return errors.New("-key and one of -request or -proposal are required")
 	}
-	if *replaceHeld && *proposalPath != "" {
+	if *replaceHeld != "" && *proposalPath != "" {
 		return errors.New("-replace-held is set when a proposal starts (with -request), not later")
 	}
 	chainID, subnetID, err := l1.ids()
@@ -579,12 +653,17 @@ func cmdApprove(args []string) error {
 			return err
 		}
 		c = &change{unsigned: unsigned, reg: reg}
-		p = &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), BLSProofOfPossession: pop, ReplaceHeld: *replaceHeld}
+		p = &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), BLSProofOfPossession: pop, ReplaceHeld: parseReplaceHeld(*replaceHeld)}
 		if err := c.label(p); err != nil {
 			return err
 		}
-		// A registration's approvals are good as long as the registration.
-		p.setDeadline(time.Unix(int64(reg.Expiry), 0))
+		// A registration's approvals are good as long as the registration,
+		// a replacement's for an hour.
+		deadline := time.Unix(int64(reg.Expiry), 0)
+		if len(p.ReplaceHeld) > 0 && time.Until(deadline) > replaceLife {
+			deadline = time.Now().Add(replaceLife)
+		}
+		p.setDeadline(deadline)
 	}
 	if err := c.check(p); err != nil {
 		return err
@@ -649,9 +728,9 @@ func registrationFor(requestPath string, subnetID ids.ID, weight uint64, expiry 
 func confirm(p *proposal, c *change, nodeURI string, subnetID ids.ID, yes, offline bool) error {
 	fmt.Fprintf(os.Stderr, "\nThe change:      %s\n", p.Summary)
 	fmt.Fprintf(os.Stderr, "Approvals until: %s\n", p.DeadlineUTC)
-	if p.ReplaceHeld {
-		fmt.Fprint(os.Stderr, "REPLACES whatever change the validators hold, and needs every admin. A held change that was\n"+
-			"already signed by enough validators can still reach the P-Chain: check none is waiting to be submitted.\n")
+	if len(p.ReplaceHeld) > 0 {
+		fmt.Fprintf(os.Stderr, "REPLACES the held changes %s, and needs every admin. A held change already signed by\n"+
+			"enough validators can still reach the P-Chain: check none is waiting to be submitted.\n", strings.Join(p.ReplaceHeld, ", "))
 	}
 	if len(p.ApprovedBy) > 0 {
 		fmt.Fprintf(os.Stderr, "Approved by:     %s (recovered from their signatures)\n", strings.Join(p.ApprovedBy, ", "))
@@ -779,6 +858,61 @@ func shareReport(c *change, nodeURI string, subnetID ids.ID, offline bool) (stri
 		}
 	}
 	return b.String(), nil
+}
+
+// cmdHeld shows the validator change a node holds (it signs no other until
+// that one is on the P-Chain or can't be), with the hash a replacement names.
+func cmdHeld(args []string) error {
+	fs := flag.NewFlagSet("held", flag.ExitOnError)
+	l1 := addL1Flags(fs)
+	sf := addSubmitFlags(fs, false)
+	_ = fs.Parse(args)
+	if *sf.rpcPassFile == "" {
+		return errors.New("-rpc-pass-file is required")
+	}
+	chainID, _, err := l1.ids()
+	if err != nil {
+		return err
+	}
+	pass, err := os.ReadFile(*sf.rpcPassFile)
+	if err != nil {
+		return fmt.Errorf("-rpc-pass-file: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(*l1.nodeURI, "/")+"/ext/bc/"+chainID.String()+"/validators", nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(*sf.rpcUser, strings.TrimSpace(string(pass)))
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s", strings.TrimSpace(string(raw)))
+	}
+	var reply struct {
+		Held     *string `json:"held"`
+		HeldHash string  `json:"heldHash"`
+		Height   uint64  `json:"height"`
+	}
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return err
+	}
+	out := map[string]any{"held": nil}
+	if reply.Held != nil {
+		out = map[string]any{"heldHash": reply.HeldHash, "height": reply.Height}
+		if b, err := unhex(*reply.Held, "held"); err == nil {
+			if c, err := parseChange(uint32(*l1.networkID), chainID, b); err == nil {
+				var p proposal
+				if c.label(&p) == nil {
+					out["summary"] = p.Summary
+				}
+			}
+		}
+	}
+	return printJSON(out)
 }
 
 // cmdSubmit has the validators sign a proposal with enough approvals.
@@ -930,7 +1064,7 @@ func weightProposal(name string, args []string, withWeight bool) error {
 	if withWeight {
 		newWeight = fs.Uint64("weight", 0, "its new weight (above 0; remove sets 0)")
 	}
-	replaceHeld := fs.Bool("replace-held", false, "the change replaces whatever change the validators hold (only if every admin approves)")
+	replaceHeld := fs.String("replace-held", "", "HASH[,HASH...] of the held changes (from held) this one replaces; every admin must approve")
 	keyPath := fs.String("key", "", "an admin key")
 	valid := fs.Duration("valid-for", 72*time.Hour, "how long the other admins have to approve (at most "+vm.MaxApprovalLife.String()+")")
 	yes := fs.Bool("yes", false, "approve without asking")
@@ -968,9 +1102,12 @@ func weightProposal(name string, args []string, withWeight bool) error {
 		return err
 	}
 	c := &change{unsigned: unsigned, weight: w}
-	p := &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), ReplaceHeld: *replaceHeld}
+	p := &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), ReplaceHeld: parseReplaceHeld(*replaceHeld)}
 	if err := c.label(p); err != nil {
 		return err
+	}
+	if len(p.ReplaceHeld) > 0 && *valid > replaceLife {
+		*valid = replaceLife
 	}
 	p.setDeadline(time.Now().Add(*valid))
 	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes, false); err != nil {

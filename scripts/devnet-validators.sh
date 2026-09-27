@@ -13,10 +13,10 @@
 # 3. Adds nodes 2, 3 and 4: request -> approve (admin 1 starts the
 #    proposal) -> approve (the next admins) -> submit via node 1 -> register
 #    (paid by the local network's public ewoq key). A newcomer can't sign
-#    until it's active, so nodes 2 and 3 join at small weights (40, 90) and
-#    are raised to 100 once active; with up to three validators one could
-#    block the 67% alone, so those changes need all three admins. Node 4
-#    joins at 100 (25% each) with two.
+#    until it's active, so nodes 2 and 3 join at weight 1 and are raised to
+#    100 once active (a raise needs the raised node's own signature); with
+#    up to three validators one could block the 67% alone, so those changes
+#    need all three admins. Node 4 joins at 100 (25% each) with two.
 # 4. Sends payments until each of the four validators has built blocks and
 #    been paid their fees; node 5, not a validator, builds none.
 # 5. Removes node 3: two admins are refused (it leaves 33.3% each), all
@@ -246,9 +246,9 @@ if submit "$DIR/proposal2-two.json" "$DIR/out2.json" 2>"$DIR/err2.txt"; then
 fi
 grep -q "needs all 3 admins" "$DIR/err2.txt" || fail "unexpected refusal: $(cat "$DIR/err2.txt")"
 ok "two admins can't while one validator could block the 67%"
-add_validator 2 40 2 3
+add_validator 2 1 2 3
 raise 2 100 2 3
-add_validator 3 90 2 3
+add_validator 3 1 2 3
 raise 3 100 2 3
 # 3 -> 4 at 100: 300 of 400 can sign, 25% each: two admins are enough.
 add_validator 4 100 2
@@ -405,7 +405,10 @@ submit "$DIR/pending5.json" "$DIR/signed5-again.json" || fail "the same change w
 ok "the outstanding change itself can be signed again"
 # The way out when validators hold changes that can't go ahead: every admin
 # together approves one flagged to replace them.
-"$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N4" -key "$DIR/admin1.json" -replace-held -yes >"$DIR/replace4.json"
+# The hash of the change the validators hold (node 1's; all signed it).
+HELD=$("$BIN/btcvm-l1" held "${L1[@]}" -node-uri "$(uri 1)" -rpc-pass-file "$DIR/rpc-password" | jq -r .heldHash)
+[[ $HELD == 0x* ]] || fail "node 1 holds no change"
+"$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N4" -key "$DIR/admin1.json" -replace-held "$HELD" -yes >"$DIR/replace4.json"
 approvals "$DIR/replace4.json" 2
 if submit "$DIR/replace4.json" "$DIR/replaced4.json" 2>"$DIR/err8.txt"; then
   fail "two admins replaced a held change"

@@ -114,7 +114,7 @@ func TestProposalApprovals(t *testing.T) {
 	// So does the replace flag, turned on or off after approving: it's part
 	// of what each admin signed.
 	flipped := *read
-	flipped.ReplaceHeld = !flipped.ReplaceHeld
+	flipped.ReplaceHeld = []string{"0x" + strings.Repeat("ab", 32)}
 	_, flippedWho, _ := flipped.approvals(rc.unsigned)
 	if flippedWho[0] == who[0] || flippedWho[1] == who[1] {
 		t.Fatal("approvals still verify as the admins' after the replace flag changed")

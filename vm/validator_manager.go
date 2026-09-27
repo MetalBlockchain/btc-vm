@@ -89,16 +89,21 @@ const aggregateTimeout = 30 * time.Second
 
 // ApprovalVersion is the format of an approval and of the justification
 // that carries approvals.
-const ApprovalVersion byte = 2
+const ApprovalVersion byte = 3
 
 // Approval flags: part of what every admin signs.
 const (
-	// FlagReplaceHeld: the change replaces whatever change a validator
-	// holds (see the package comment). Only with every admin's approval.
+	// FlagReplaceHeld: the change replaces a held change (see the package
+	// comment), but only one the approval names: it carries the SHA-256 of
+	// each held message it may replace, so it can't be kept and used on a
+	// later one. Only with every admin's approval.
 	FlagReplaceHeld byte = 1 << 0
 
 	knownFlags = FlagReplaceHeld
 )
+
+// MaxReplaced bounds the held changes one replacement names.
+const MaxReplaced = 16
 
 // MaxApprovalLife bounds how far ahead an approval's deadline can be: long
 // enough for admins to sign in turn, short enough that a forgotten
@@ -109,61 +114,94 @@ const MaxApprovalLife = 7 * 24 * time.Hour
 // registration's expiry can be.
 const MaxRegistrationLife = 24 * time.Hour
 
-// justificationHeader is the version byte, the flags byte and the 8-byte
-// deadline.
-const justificationHeader = 1 + 1 + 8
-
-// ApprovalHash is what every admin signs to approve an unsigned Warp message
-// with the given flags until deadline (Unix seconds):
-//
-//	sha256(ApprovalDomain || ApprovalVersion || flags || deadline, 8 bytes big-endian || unsigned message)
-func ApprovalHash(unsignedMessage []byte, flags byte, deadline uint64) []byte {
-	h := sha256.New()
-	h.Write([]byte(ApprovalDomain))
-	h.Write([]byte{ApprovalVersion, flags})
-	var d [8]byte
-	binary.BigEndian.PutUint64(d[:], deadline)
-	h.Write(d[:])
-	h.Write(unsignedMessage)
-	return h.Sum(nil)
+// Approval says what every admin approves: the unsigned Warp message, with
+// flags, until a deadline, and for a replacement the held messages (their
+// SHA-256) it may replace.
+type Approval struct {
+	Flags    byte
+	Deadline uint64 // Unix seconds
+	Replaces [][32]byte
 }
 
-// EncodeJustification is the ACP-118 justification for approvals of one
-// message, all with the same flags and deadline:
+// HeldHash identifies a held change: the SHA-256 of its unsigned message.
+func HeldHash(unsignedMessage []byte) [32]byte { return sha256.Sum256(unsignedMessage) }
+
+// header is the approval's fixed part, as signed and as carried:
 //
-//	ApprovalVersion || flags || deadline, 8 bytes big-endian || approval (65 bytes) ...
-func EncodeJustification(flags byte, deadline uint64, approvals [][]byte) []byte {
-	out := make([]byte, justificationHeader, justificationHeader+len(approvals)*secp256k1.SignatureLen)
-	out[0], out[1] = ApprovalVersion, flags
-	binary.BigEndian.PutUint64(out[2:], deadline)
-	for _, a := range approvals {
-		out = append(out, a...)
+//	ApprovalVersion || flags || deadline (8 bytes, big-endian) || count || count SHA-256 hashes
+//
+// (count and hashes only with FlagReplaceHeld).
+func (a Approval) header() []byte {
+	out := []byte{ApprovalVersion, a.Flags}
+	out = binary.BigEndian.AppendUint64(out, a.Deadline)
+	if a.Flags&FlagReplaceHeld != 0 {
+		out = append(out, byte(len(a.Replaces)))
+		for _, h := range a.Replaces {
+			out = append(out, h[:]...)
+		}
 	}
 	return out
 }
 
-func decodeJustification(b []byte) (byte, uint64, [][]byte, error) {
-	if len(b) < justificationHeader {
-		return 0, 0, nil, errors.New("the change carries no admin approvals")
+// ApprovalHash is what every admin signs to approve an unsigned Warp message:
+//
+//	sha256(ApprovalDomain || header || unsigned message)
+func ApprovalHash(unsignedMessage []byte, a Approval) []byte {
+	h := sha256.New()
+	h.Write([]byte(ApprovalDomain))
+	h.Write(a.header())
+	h.Write(unsignedMessage)
+	return h.Sum(nil)
+}
+
+// EncodeJustification is the ACP-118 justification: the header, then each
+// admin's 65-byte approval of the same message and header.
+func EncodeJustification(a Approval, approvals [][]byte) []byte {
+	out := a.header()
+	for _, sig := range approvals {
+		out = append(out, sig...)
+	}
+	return out
+}
+
+func decodeJustification(b []byte) (Approval, [][]byte, error) {
+	var a Approval
+	if len(b) < 10 {
+		return a, nil, errors.New("the change carries no admin approvals")
 	}
 	if b[0] != ApprovalVersion {
-		return 0, 0, nil, fmt.Errorf("approval format %d; this node reads format %d", b[0], ApprovalVersion)
+		return a, nil, fmt.Errorf("approval format %d; this node reads format %d", b[0], ApprovalVersion)
 	}
-	flags := b[1]
-	if flags&^knownFlags != 0 {
-		return 0, 0, nil, fmt.Errorf("approval flags %#x include ones this node doesn't know", flags)
+	a.Flags = b[1]
+	if a.Flags&^knownFlags != 0 {
+		return a, nil, fmt.Errorf("approval flags %#x include ones this node doesn't know", a.Flags)
 	}
-	deadline := binary.BigEndian.Uint64(b[2:justificationHeader])
-	rest := b[justificationHeader:]
+	a.Deadline = binary.BigEndian.Uint64(b[2:10])
+	rest := b[10:]
+	if a.Flags&FlagReplaceHeld != 0 {
+		if len(rest) < 1 {
+			return a, nil, errors.New("a replacement must name the held changes it replaces")
+		}
+		n := int(rest[0])
+		if n == 0 || n > MaxReplaced || len(rest) < 1+32*n {
+			return a, nil, fmt.Errorf("a replacement names 1 to %d held changes", MaxReplaced)
+		}
+		for i := range n {
+			var h [32]byte
+			copy(h[:], rest[1+32*i:1+32*(i+1)])
+			a.Replaces = append(a.Replaces, h)
+		}
+		rest = rest[1+32*n:]
+	}
 	if len(rest) == 0 || len(rest)%secp256k1.SignatureLen != 0 {
-		return 0, 0, nil, errors.New("the change carries no whole admin approvals (each is a 65-byte signature)")
+		return a, nil, errors.New("the change carries no whole admin approvals (each is a 65-byte signature)")
 	}
 	var sigs [][]byte
 	for len(rest) > 0 {
 		sigs = append(sigs, rest[:secp256k1.SignatureLen])
 		rest = rest[secp256k1.SignatureLen:]
 	}
-	return flags, deadline, sigs, nil
+	return a, sigs, nil
 }
 
 // validatorAdminsConfig is the part of the chain config the manager reads.
@@ -240,6 +278,8 @@ type validatorManager struct {
 	// ready once the chain has bootstrapped: before, its view of the L1 and
 	// the P-Chain can be behind, so it signs nothing.
 	ready atomic.Bool
+	// broken after a failed write of the held change: signs nothing more.
+	broken atomic.Bool
 
 	heldMu sync.Mutex
 }
@@ -346,6 +386,9 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 	if !m.ready.Load() {
 		return appError(errCodeBusy, "this node is still bootstrapping; it signs nothing yet")
 	}
+	if m.broken.Load() {
+		return appError(errCodeBusy, "this node couldn't record a change it was asked to sign; it signs nothing more until it restarts")
+	}
 	if msg.NetworkID != snowCtx.NetworkID || msg.SourceChainID != snowCtx.ChainID {
 		return appError(errCodeNotManaged, "message is for network %d chain %s, not this chain", msg.NetworkID, msg.SourceChainID)
 	}
@@ -377,7 +420,7 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 	if m.policy.admins.Len() == 0 {
 		return appError(errCodeNotApproved, "this node has no validatorAdmins in its chain config, so it approves no validator changes")
 	}
-	approvers, flags, err := m.policy.approvers(msg.Bytes(), justification, now)
+	approvers, approval, err := m.policy.approvers(msg.Bytes(), justification, now)
 	if err != nil {
 		return appError(errCodeNotApproved, "%s", err)
 	}
@@ -385,7 +428,7 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 		return appError(errCodeNotApproved, "approved by %d of this L1's admins; it needs %d", approvers.Len(), m.policy.threshold)
 	}
 	all := approvers.Len() >= m.policy.admins.Len()
-	replaceHeld := flags&FlagReplaceHeld != 0
+	replaceHeld := approval.Flags&FlagReplaceHeld != 0
 	if replaceHeld && !all {
 		return appError(errCodeNotApproved, "only every admin together may replace a change the validators hold; %d of %d approved", approvers.Len(), m.policy.admins.Len())
 	}
@@ -402,6 +445,9 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 		if !ok {
 			return appError(errCodeNotManaged, "validation %s is not one of this L1's validators", w.ValidationID)
 		}
+		if w.Nonce == math.MaxUint64 {
+			return appError(errCodeNotManaged, "a weight change at nonce %d could never be followed by another", w.Nonce)
+		}
 		if w.Nonce != v.MinNonce {
 			return appError(errCodeNotManaged, "the weight change has nonce %d; the P-Chain expects %d for this validation", w.Nonce, v.MinNonce)
 		}
@@ -411,6 +457,9 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 		return appError(errCodeBusy, "%s", err)
 	}
 	same := held != nil && bytes.Equal(held.Message, msg.Bytes())
+	if held != nil && !same && replaceHeld && !names(approval.Replaces, HeldHash(held.Message)) {
+		return appError(errCodeNotApproved, "the replacement doesn't name the change this node holds (%x); approve one that does", HeldHash(held.Message))
+	}
 	if held != nil && !same && !replaceHeld {
 		if height < held.Height {
 			return appError(errCodeBusy, "this node's view of the P-Chain (height %d) is older than the change it holds (%d); try again shortly", height, held.Height)
@@ -422,12 +471,27 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 	if appErr := m.policy.checkChange(parsed, current, approvers.Len()); appErr != nil {
 		return appErr
 	}
-	if !same {
-		if err := m.lock.write(heldChange{Message: msg.Bytes(), Height: height}); err != nil {
-			return appError(errCodeBusy, "recording the change before signing it: %s", err)
-		}
+	// Written (again, if it's the one held) and synced before each
+	// signature: a retry after a failed sync must not sign on a record the
+	// disk may not have. A failed write stops all signing until restart.
+	record := heldChange{Message: msg.Bytes(), Height: height}
+	if same {
+		record = *held
+	}
+	if err := m.lock.write(record); err != nil {
+		m.broken.Store(true)
+		return appError(errCodeBusy, "recording the change before signing it failed (%s); this node signs nothing more until it restarts", err)
 	}
 	return nil
+}
+
+func names(list [][32]byte, h [32]byte) bool {
+	for _, x := range list {
+		if x == h {
+			return true
+		}
+	}
+	return false
 }
 
 // Past a registration's expiry, the P-Chain (whose clock can trail this
@@ -656,49 +720,50 @@ func percent(w, total *big.Int) string {
 // who gave them. An approval from a key that isn't an admin, a second one
 // from the same admin, or a justification that isn't whole approvals
 // refuses the lot: a well-formed request never has them.
-func (p adminPolicy) approvers(unsignedMessage, justification []byte, now time.Time) (set.Set[ids.ShortID], byte, error) {
-	flags, deadline, sigs, err := decodeJustification(justification)
+func (p adminPolicy) approvers(unsignedMessage, justification []byte, now time.Time) (set.Set[ids.ShortID], Approval, error) {
+	approval, sigs, err := decodeJustification(justification)
 	if err != nil {
-		return nil, 0, err
+		return nil, approval, err
 	}
+	deadline := approval.Deadline
 	switch at := time.Unix(int64(deadline), 0); {
 	case deadline > uint64(now.Add(MaxApprovalLife).Unix()):
-		return nil, 0, fmt.Errorf("the approvals' deadline %s is more than %s away", at.UTC().Format(time.RFC3339), MaxApprovalLife)
+		return nil, approval, fmt.Errorf("the approvals' deadline %s is more than %s away", at.UTC().Format(time.RFC3339), MaxApprovalLife)
 	case uint64(now.Unix()) > deadline:
-		return nil, 0, fmt.Errorf("the approvals expired at %s", at.UTC().Format(time.RFC3339))
+		return nil, approval, fmt.Errorf("the approvals expired at %s", at.UTC().Format(time.RFC3339))
 	}
 	if len(sigs) > p.admins.Len() {
-		return nil, 0, fmt.Errorf("%d approvals, but this L1 has only %d admins", len(sigs), p.admins.Len())
+		return nil, approval, fmt.Errorf("%d approvals, but this L1 has only %d admins", len(sigs), p.admins.Len())
 	}
-	hash := ApprovalHash(unsignedMessage, flags, deadline)
+	hash := ApprovalHash(unsignedMessage, approval)
 	approvers := set.NewSet[ids.ShortID](len(sigs))
 	for i, sig := range sigs {
 		pub, err := secp256k1.RecoverPublicKeyFromHash(hash, sig)
 		if err != nil {
-			return nil, 0, fmt.Errorf("approval %d: %w", i+1, err)
+			return nil, approval, fmt.Errorf("approval %d: %w", i+1, err)
 		}
 		who := pub.Address()
 		if !p.admins.Contains(who) {
-			return nil, 0, fmt.Errorf("approval %d is by %s, which is not one of this L1's validatorAdmins", i+1, who)
+			return nil, approval, fmt.Errorf("approval %d is by %s, which is not one of this L1's validatorAdmins", i+1, who)
 		}
 		if approvers.Contains(who) {
-			return nil, 0, fmt.Errorf("approval %d repeats admin %s", i+1, who)
+			return nil, approval, fmt.Errorf("approval %d repeats admin %s", i+1, who)
 		}
 		approvers.Add(who)
 	}
-	return approvers, flags, nil
+	return approvers, approval, nil
 }
 
 // Aggregate signs an approved change with this node's key, collects the
 // other validators' signatures, and returns the signed Warp message with
 // the weight that signed it.
-func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, justification []byte) (*warp.Message, *big.Int, *big.Int, error) {
+func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, justification []byte, required ids.NodeID) (*warp.Message, *big.Int, *big.Int, []ids.NodeID, error) {
 	ctx, cancel := context.WithTimeout(parent, aggregateTimeout)
 	defer cancel()
 
 	unsigned, err := warp.ParseUnsignedMessage(unsignedBytes)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("not a Warp message: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("not a Warp message: %w", err)
 	}
 	snowCtx := m.vm.ctx
 	// The P-Chain checks the signatures against the L1's validators at the
@@ -708,44 +773,44 @@ func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, just
 	// itself would count it; until then, a change needs a retry.
 	height, err := snowCtx.ValidatorState.GetMinimumHeight(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("reading the P-Chain height: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("reading the P-Chain height: %w", err)
 	}
 	vdrs, err := warp.GetCanonicalValidatorSetFromSubnetID(ctx, snowCtx.ValidatorState, height, snowCtx.SubnetID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("reading the L1's validators: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("reading the L1's validators: %w", err)
 	}
 	tip, err := snowCtx.ValidatorState.GetCurrentHeight(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("reading the P-Chain height: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("reading the P-Chain height: %w", err)
 	}
 	if tip != height {
 		now, err := warp.GetCanonicalValidatorSetFromSubnetID(ctx, snowCtx.ValidatorState, tip, snowCtx.SubnetID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("reading the L1's validators: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("reading the L1's validators: %w", err)
 		}
 		if !sameValidators(vdrs, now) {
-			return nil, nil, nil, errValidatorSetSettling
+			return nil, nil, nil, nil, errValidatorSetSettling
 		}
 	}
 
 	// Only now, when this node will sign and ask the others to: Verify
 	// records the change as this node's outstanding one.
 	if appErr := m.Verify(ctx, unsigned, justification); appErr != nil {
-		return nil, nil, nil, errors.New(appErr.Message)
+		return nil, nil, nil, nil, errors.New(appErr.Message)
 	}
 	need := requiredWeight(vdrs.TotalWeight)
-	signed, weight, err := m.collect(ctx, unsigned, justification, vdrs, need)
+	signed, weight, signers, err := m.collect(ctx, unsigned, justification, vdrs, need, required)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	total := new(big.Int).SetUint64(vdrs.TotalWeight)
 	// The P-Chain's own check, at the same quorum, before anyone gets it: a
 	// message it would reject (too little weight, a bad signature) never
 	// leaves this node.
 	if err := signed.Signature.Verify(unsigned, snowCtx.NetworkID, vdrs, 67, 100); err != nil {
-		return nil, nil, nil, fmt.Errorf("only weight %s of %d signed (the P-Chain needs %d): %w", weight, vdrs.TotalWeight, need, err)
+		return nil, nil, nil, nil, fmt.Errorf("only weight %s of %d signed (the P-Chain needs %d): %w", weight, vdrs.TotalWeight, need, err)
 	}
-	return signed, weight, total, nil
+	return signed, weight, total, signers, nil
 }
 
 type signatureReply struct {
@@ -758,7 +823,11 @@ type signatureReply struct {
 // acp118.SignatureAggregator sends replies on an unbuffered channel it
 // stops reading once it has enough, so each late reply blocks one of the
 // chain's app-message workers for good. Here late replies are dropped.)
-func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedMessage, justification []byte, vdrs warp.CanonicalValidatorSet, need uint64) (*warp.Message, *big.Int, error) {
+//
+// With required set, it also waits for that validator's own signature: a
+// raise must show the validator being raised signs, or the raise could
+// leave the L1 short of 67% able to sign.
+func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedMessage, justification []byte, vdrs warp.CanonicalValidatorSet, need uint64, required ids.NodeID) (*warp.Message, *big.Int, []ids.NodeID, error) {
 	snowCtx := m.vm.ctx
 	bits := set.NewBits()
 	var sigs []*bls.Signature
@@ -783,13 +852,25 @@ func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedM
 	if i, ok := nodeIndex[snowCtx.NodeID]; ok {
 		raw, err := snowCtx.WarpSigner.Sign(unsigned)
 		if err != nil {
-			return nil, nil, fmt.Errorf("signing: %w", err)
+			return nil, nil, nil, fmt.Errorf("signing: %w", err)
 		}
 		if sig, err := bls.SignatureFromBytes(raw); err == nil && bls.Verify(vdrs.Validators[i].PublicKey, sig, unsigned.Bytes()) {
 			add(i, sig)
 		} else {
 			snowCtx.Log.Warn("this node's signature doesn't match its registered BLS key; not counting it")
 		}
+	}
+
+	requiredIndex := -1
+	if required != ids.EmptyNodeID {
+		i, ok := nodeIndex[required]
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("%s isn't among the validators the signatures are checked against yet; try again shortly", required)
+		}
+		requiredIndex = i
+	}
+	enough := func() bool {
+		return weight.Cmp(new(big.Int).SetUint64(need)) >= 0 && (requiredIndex < 0 || bits.Contains(requiredIndex))
 	}
 
 	others := set.Set[ids.NodeID]{}
@@ -799,10 +880,10 @@ func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedM
 		}
 	}
 	replies := make(chan signatureReply, others.Len()) // never blocks a sender
-	if others.Len() > 0 && weight.Cmp(new(big.Int).SetUint64(need)) < 0 {
+	if others.Len() > 0 && !enough() {
 		request, err := proto.Marshal(&sdk.SignatureRequest{Message: unsigned.Bytes(), Justification: justification})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		onReply := func(_ context.Context, nodeID ids.NodeID, response []byte, err error) {
 			i, ok := nodeIndex[nodeID]
@@ -830,9 +911,9 @@ func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedM
 			}
 		}
 		if err := m.client.AppRequest(ctx, others, request, onReply); err != nil {
-			return nil, nil, fmt.Errorf("asking the other validators: %w", err)
+			return nil, nil, nil, fmt.Errorf("asking the other validators: %w", err)
 		}
-		for answered := 0; answered < others.Len() && weight.Cmp(new(big.Int).SetUint64(need)) < 0; answered++ {
+		for answered := 0; answered < others.Len() && !enough(); answered++ {
 			select {
 			case <-ctx.Done():
 				answered = others.Len()
@@ -843,17 +924,26 @@ func (m *validatorManager) collect(ctx context.Context, unsigned *warp.UnsignedM
 			}
 		}
 	}
+	if requiredIndex >= 0 && !bits.Contains(requiredIndex) {
+		return nil, nil, nil, fmt.Errorf("%s didn't sign (it isn't online, funded and caught up yet): not raising it", required)
+	}
 	if len(sigs) == 0 {
-		return nil, nil, errors.New("no validator signed")
+		return nil, nil, nil, errors.New("no validator signed")
 	}
 	agg, err := bls.AggregateSignatures(sigs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	sig := &warp.BitSetSignature{Signers: bits.Bytes()}
 	copy(sig.Signature[:], bls.SignatureToBytes(agg))
 	msg, err := warp.NewMessage(unsigned, sig)
-	return msg, weight, err
+	var signers []ids.NodeID
+	for i := range vdrs.Validators {
+		if bits.Contains(i) {
+			signers = append(signers, vdrs.Validators[i].NodeIDs...)
+		}
+	}
+	return msg, weight, signers, err
 }
 
 // requiredWeight is the least signing weight the P-Chain accepts out of
@@ -914,13 +1004,16 @@ func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy, lockP
 
 type aggregateRequest struct {
 	Message       string `json:"message"`       // hex unsigned Warp message
-	Justification string `json:"justification"` // hex admin approvals, one after another
+	Justification string `json:"justification"` // hex EncodeJustification
+	// A validator whose own signature must be among them (for a raise).
+	RequireSigner string `json:"requireSigner,omitempty"`
 }
 
 type aggregateReply struct {
-	SignedMessage string `json:"signedMessage"`
-	SignedWeight  string `json:"signedWeight"`
-	TotalWeight   string `json:"totalWeight"`
+	SignedMessage string   `json:"signedMessage"`
+	SignedWeight  string   `json:"signedWeight"`
+	TotalWeight   string   `json:"totalWeight"`
+	Signers       []string `json:"signers"` // NodeIDs whose signatures it holds
 }
 
 func decodeHex(s string) ([]byte, error) {
@@ -935,8 +1028,8 @@ func (m *validatorManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fail := func(code int, format string, args ...any) {
 		http.Error(w, fmt.Sprintf(format, args...), code)
 	}
-	if r.Method != http.MethodPost {
-		fail(http.StatusMethodNotAllowed, "POST a JSON {message, justification}")
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		fail(http.StatusMethodNotAllowed, "POST a JSON {message, justification}, or GET the change this node holds")
 		return
 	}
 	cfg := m.vm.config
@@ -949,6 +1042,25 @@ func (m *validatorManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		subtle.ConstantTimeCompare([]byte(user), []byte(cfg.RPCUser)) != 1 ||
 		subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.RPCPass)) != 1 {
 		fail(http.StatusUnauthorized, "this needs the chain's rpcUser and rpcPass")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet {
+		// The change this node holds, for admins replacing held changes
+		// (a replacement names each by its HeldHash).
+		m.heldMu.Lock()
+		held, err := m.lock.read()
+		m.heldMu.Unlock()
+		if err != nil {
+			fail(http.StatusInternalServerError, "%s", err)
+			return
+		}
+		reply := map[string]any{"held": nil}
+		if held != nil {
+			h := HeldHash(held.Message)
+			reply = map[string]any{"held": "0x" + hex.EncodeToString(held.Message), "heldHash": "0x" + hex.EncodeToString(h[:]), "height": held.Height}
+		}
+		_ = json.NewEncoder(w).Encode(reply)
 		return
 	}
 	var req aggregateRequest
@@ -966,15 +1078,26 @@ func (m *validatorManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusBadRequest, "justification: %s", err)
 		return
 	}
-	msg, signed, total, err := m.Aggregate(r.Context(), unsigned, justification)
+	required := ids.EmptyNodeID
+	if req.RequireSigner != "" {
+		if required, err = ids.NodeIDFromString(req.RequireSigner); err != nil {
+			fail(http.StatusBadRequest, "requireSigner: %s", err)
+			return
+		}
+	}
+	msg, signed, total, signers, err := m.Aggregate(r.Context(), unsigned, justification, required)
 	if err != nil {
 		fail(http.StatusForbidden, "%s", err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(aggregateReply{
+	reply := aggregateReply{
 		SignedMessage: "0x" + hex.EncodeToString(msg.Bytes()),
 		SignedWeight:  signed.String(),
 		TotalWeight:   total.String(),
-	})
+		Signers:       []string{},
+	}
+	for _, n := range signers {
+		reply.Signers = append(reply.Signers, n.String())
+	}
+	_ = json.NewEncoder(w).Encode(reply)
 }

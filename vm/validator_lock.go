@@ -46,15 +46,22 @@ func (l changeLock) read() (*heldChange, error) {
 }
 
 // write replaces the held change durably: a temporary file, synced, renamed
-// over the old one, and the directory synced.
+// over the old one, and the directory synced (and, when it's new, the
+// directory holding it).
 func (l changeLock) write(h heldChange) error {
 	raw, err := json.Marshal(h)
 	if err != nil {
 		return err
 	}
 	dir := filepath.Dir(l.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		// The new directory's own entry must reach the disk too.
+		if err := syncDir(filepath.Dir(dir)); err != nil {
+			return err
+		}
 	}
 	tmp, err := os.CreateTemp(dir, ".held-change-*")
 	if err != nil {
@@ -75,6 +82,10 @@ func (l changeLock) write(h heldChange) error {
 	if err := os.Rename(tmp.Name(), l.path); err != nil {
 		return err
 	}
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

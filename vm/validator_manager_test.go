@@ -175,11 +175,11 @@ func (f *managerFixture) weight(t *testing.T, validationID ids.ID, weight uint64
 	return w
 }
 
-func sign(t *testing.T, msg *warp.UnsignedMessage, flags byte, deadline uint64, keys ...*secp256k1.PrivateKey) [][]byte {
+func sign(t *testing.T, msg *warp.UnsignedMessage, a Approval, keys ...*secp256k1.PrivateKey) [][]byte {
 	t.Helper()
 	var out [][]byte
 	for _, key := range keys {
-		sig, err := key.SignHash(ApprovalHash(msg.Bytes(), flags, deadline))
+		sig, err := key.SignHash(ApprovalHash(msg.Bytes(), a))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -192,13 +192,15 @@ func sign(t *testing.T, msg *warp.UnsignedMessage, flags byte, deadline uint64, 
 // order, with the fixture's deadline and no flags.
 func (f *managerFixture) approve(t *testing.T, msg *warp.UnsignedMessage, keys ...*secp256k1.PrivateKey) []byte {
 	t.Helper()
-	return EncodeJustification(0, f.deadline, sign(t, msg, 0, f.deadline, keys...))
+	a := Approval{Deadline: f.deadline}
+	return EncodeJustification(a, sign(t, msg, a, keys...))
 }
 
-// approveReplacing approves msg to replace whatever change is held.
-func (f *managerFixture) approveReplacing(t *testing.T, msg *warp.UnsignedMessage, keys ...*secp256k1.PrivateKey) []byte {
+// approveReplacing approves msg to replace the held changes named.
+func (f *managerFixture) approveReplacing(t *testing.T, msg *warp.UnsignedMessage, replaces [][32]byte, keys ...*secp256k1.PrivateKey) []byte {
 	t.Helper()
-	return EncodeJustification(FlagReplaceHeld, f.deadline, sign(t, msg, FlagReplaceHeld, f.deadline, keys...))
+	a := Approval{Flags: FlagReplaceHeld, Deadline: f.deadline, Replaces: replaces}
+	return EncodeJustification(a, sign(t, msg, a, keys...))
 }
 
 func (f *managerFixture) check(t *testing.T, msg *warp.UnsignedMessage, justification []byte, wantErr string) {
@@ -235,7 +237,8 @@ func TestValidatorManagerVerify(t *testing.T) {
 	}
 	withDeadline := func(deadline uint64, keys ...*secp256k1.PrivateKey) func(*warp.UnsignedMessage) []byte {
 		return func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(0, deadline, sign(t, m, 0, deadline, keys...))
+			a := Approval{Deadline: deadline}
+			return EncodeJustification(a, sign(t, m, a, keys...))
 		}
 	}
 	now := uint64(f.now.Unix())
@@ -278,26 +281,37 @@ func TestValidatorManagerVerify(t *testing.T) {
 		{"approved by all three", good, by(c, a, b), ""},
 		{"removal of one of five by two", f.unsigned(t, f.chainID, nil, f.weight(t, target, 0)), by(b, c), ""},
 		{"no approval", good, func(*warp.UnsignedMessage) []byte { return nil }, "no admin approvals"},
-		{"a header and no approvals", good, func(*warp.UnsignedMessage) []byte { return EncodeJustification(0, f.deadline, nil) }, "no whole admin approvals"},
+		{"a header and no approvals", good, func(*warp.UnsignedMessage) []byte { return EncodeJustification(Approval{Deadline: f.deadline}, nil) }, "no whole admin approvals"},
 		{"one admin alone", good, by(a), "approved by 1 of this L1's admins; it needs 2"},
 		{"one admin twice", good, by(a, a), "repeats admin"},
 		{"an admin and an outsider", good, by(a, f.outsider), "not one of this L1's validatorAdmins"},
 		{"more approvals than admins", good, by(a, b, c, a), "only 3 admins"},
 		{"a partial approval", good, func(m *warp.UnsignedMessage) []byte { return f.approve(t, m, a, b)[:100] }, "each is a 65-byte signature"},
-		{"another format", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b); j[0] = 1; return j }, "approval format 1"},
+		{"another format", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b); j[0] = 2; return j }, "approval format 2"},
 		{"an unknown flag", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b); j[1] = 0x80; return j }, "flags"},
-		{"a flag changed after signing", good, func(m *warp.UnsignedMessage) []byte { j := f.approve(t, m, a, b, c); j[1] = FlagReplaceHeld; return j }, "not one of this L1's validatorAdmins"},
-		{"replacing held changes with two admins", good, func(m *warp.UnsignedMessage) []byte { return f.approveReplacing(t, m, a, b) }, "only every admin together"},
+		{"a replacement naming no held change", good, func(m *warp.UnsignedMessage) []byte {
+			j := f.approveReplacing(t, m, [][32]byte{{1}}, a, b, c)
+			j[10] = 0
+			return j
+		}, "names 1 to"},
+		{"a named held change swapped after signing", good, func(m *warp.UnsignedMessage) []byte {
+			j := f.approveReplacing(t, m, [][32]byte{{1}}, a, b, c)
+			j[11] = 2
+			return j
+		}, "not one of this L1's validatorAdmins"},
+		{"replacing held changes with two admins", good, func(m *warp.UnsignedMessage) []byte { return f.approveReplacing(t, m, [][32]byte{{1}}, a, b) }, "only every admin together"},
 		{"expired", good, withDeadline(now-1, a, b), "expired"},
 		{"deadline too far ahead", good, withDeadline(uint64(f.now.Add(MaxApprovalLife+time.Minute).Unix()), a, b), "more than"},
 		{"deadline changed after signing", good, func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(0, f.deadline+60, sign(t, m, 0, f.deadline, a, b))
+			return EncodeJustification(Approval{Deadline: f.deadline + 60}, sign(t, m, Approval{Deadline: f.deadline}, a, b))
 		}, "not one of this L1's validatorAdmins"},
 		{"admin signed the bare hash, not the approval", good, func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(0, f.deadline, append(sign(t, m, 0, f.deadline, b), undomained))
+			ap := Approval{Deadline: f.deadline}
+			return EncodeJustification(ap, append(sign(t, m, ap, b), undomained))
 		}, "not one of this L1's validatorAdmins"},
 		{"second approval is of a different message", good, func(m *warp.UnsignedMessage) []byte {
-			return EncodeJustification(0, f.deadline, append(sign(t, m, 0, f.deadline, a), sign(t, other, 0, f.deadline, b)...))
+			ap := Approval{Deadline: f.deadline}
+			return EncodeJustification(ap, append(sign(t, m, ap, a), sign(t, other, ap, b)...))
 		}, "not one of this L1's validatorAdmins"},
 		{"a registration already expired", f.unsigned(t, f.chainID, nil, f.registrationAt(t, f.subnetID, 100, blsKey(t), now)), by(a, b), "expire within the next"},
 		{"a registration expiring in over a day", f.unsigned(t, f.chainID, nil, f.registrationAt(t, f.subnetID, 100, blsKey(t), now+86401)), by(a, b), "expire within the next"},
@@ -306,7 +320,7 @@ func TestValidatorManagerVerify(t *testing.T) {
 		{"an owner the P-Chain would refuse", badOwnerMsg, by(a, b), "invalid registration"},
 		{"a weight change at the wrong nonce", f.unsigned(t, f.chainID, nil, wrongNonce), by(a, b, c), "the P-Chain expects 7"},
 		{"a weight change at nonce MaxUint64", f.unsigned(t, f.chainID, nil, hugeNonce), by(a, b, c), "invalid weight change"},
-		{"a removal at nonce MaxUint64 (it would hold every signer for good)", f.unsigned(t, f.chainID, nil, hugeRemoval), by(a, b, c), "the P-Chain expects 7"},
+		{"a removal at nonce MaxUint64 (it would hold every signer for good)", f.unsigned(t, f.chainID, nil, hugeRemoval), by(a, b, c), "could never be followed"},
 		{"another L1's subnet", f.unsigned(t, f.chainID, nil, f.registration(t, ids.GenerateTestID(), 100)), by(a, b), "registration is for subnet"},
 		{"weight 0 registration", f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 0)), by(a, b), "weight"},
 		{"non-empty source address", f.unsigned(t, f.chainID, []byte{1, 2, 3}, reg), by(a, b), "source address must be empty"},
@@ -495,19 +509,51 @@ func TestValidatorManagerOneChangeAtATime(t *testing.T) {
 }
 
 // Validators holding different changes (so neither reaches 67%) can be
-// freed by every admin together, never by fewer.
+// freed by every admin together, never by fewer, and only from the held
+// changes the replacement names: a saved one can't reset a later hold.
 func TestValidatorManagerReplaceHeld(t *testing.T) {
 	f := newManagerFixture(t, true, 6)
 	a := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
 	f.check(t, a, f.approve(t, a, f.admins[0], f.admins[1]), "")
 	c := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	heldA := HeldHash(a.Bytes())
 	f.check(t, c, f.approve(t, c, f.admins...), "isn't on the P-Chain yet") // unanimity alone isn't enough
-	f.check(t, c, f.approveReplacing(t, c, f.admins[0], f.admins[1]), "only every admin together")
-	f.check(t, c, f.approveReplacing(t, c, f.admins...), "")
+	f.check(t, c, f.approveReplacing(t, c, [][32]byte{heldA}, f.admins[0], f.admins[1]), "only every admin together")
+	f.check(t, c, f.approveReplacing(t, c, [][32]byte{{9}}, f.admins...), "doesn't name the change this node holds")
+	// A split: the replacement names both held changes; any node holding
+	// either is freed.
+	b := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	replaceBoth := f.approveReplacing(t, c, [][32]byte{HeldHash(b.Bytes()), heldA}, f.admins...)
+	f.check(t, c, replaceBoth, "")
 	held, err := f.m.lock.read()
 	if err != nil || held == nil || !bytes.Equal(held.Message, c.Bytes()) {
 		t.Fatalf("held %v, %v; want the replacing change", held, err)
 	}
+	// Kept and used later, on a new hold, it frees nothing: the new hold
+	// isn't among those it names. (Here: a new change d, held after c.)
+	f.fresh(t)
+	d := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, d, f.approve(t, d, f.admins[0], f.admins[1]), "")
+	f.check(t, c, replaceBoth, "doesn't name the change this node holds")
+}
+
+// A failed write of the held change stops all signing, and a retry of the
+// same change rewrites it (so a record the disk may not have isn't trusted).
+func TestValidatorManagerStopsAfterAFailedRecord(t *testing.T) {
+	f := newManagerFixture(t, true, 6)
+	a := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	j := f.approve(t, a, f.admins[0], f.admins[1])
+	f.check(t, a, j, "")
+	dir := filepath.Dir(f.m.lock.path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)                               //nolint:errcheck // cleanup
+	f.check(t, a, j, "signs nothing more until it restarts") // the same change: rewritten, and that fails
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.check(t, a, j, "signs nothing more until it restarts") // latched
 }
 
 func TestChangeLockIsDurableAndStrict(t *testing.T) {
@@ -594,17 +640,29 @@ func TestValidatorManagerWithoutAdminsSignsNothing(t *testing.T) {
 // these bytes must not change.
 func TestApprovalHashVector(t *testing.T) {
 	msg := []byte("unsigned warp message bytes")
-	for flags, want := range map[byte]string{
-		0:               "59998b8f90c7e6f69494641cdbdde700b472bb2c4aa0d2eb99432edce65e1d3a",
-		FlagReplaceHeld: "0349859280fb5e42ea168747d2696fd06da51db291ae08e2fea4e9ea84d897f5",
+	var named [32]byte
+	for i := range named {
+		named[i] = 0xab
+	}
+	for _, tc := range []struct {
+		a    Approval
+		want string
+	}{
+		{Approval{Deadline: 1_800_000_000}, "51dd794736aa128ac3063b1f3ec5124006e12a2951b187aaed0d94b8e107e4d8"},
+		{Approval{Flags: FlagReplaceHeld, Deadline: 1_800_000_000, Replaces: [][32]byte{named}}, "21bb593acd992e4d3e0d0260889b1ec0c344f17b567a42f27ea0ff3c88778ab4"},
 	} {
-		if got := hex.EncodeToString(ApprovalHash(msg, flags, 1_800_000_000)); got != want {
-			t.Fatalf("ApprovalHash vector (flags %d) = %s; want %s", flags, got, want)
+		if got := hex.EncodeToString(ApprovalHash(msg, tc.a)); got != tc.want {
+			t.Fatalf("ApprovalHash vector (flags %d) = %s; want %s", tc.a.Flags, got, tc.want)
 		}
 	}
-	j := EncodeJustification(FlagReplaceHeld, 1_800_000_000, [][]byte{bytes.Repeat([]byte{7}, 65)})
-	if hex.EncodeToString(j[:10]) != "0201000000006b49d200" || len(j) != 10+65 {
-		t.Fatalf("justification header %x", j[:10])
+	a := Approval{Flags: FlagReplaceHeld, Deadline: 1_800_000_000, Replaces: [][32]byte{named}}
+	j := EncodeJustification(a, [][]byte{bytes.Repeat([]byte{7}, 65)})
+	if hex.EncodeToString(j[:11]) != "0301000000006b49d20001" || len(j) != 11+32+65 {
+		t.Fatalf("justification header %x", j[:11])
+	}
+	back, sigs, err := decodeJustification(j)
+	if err != nil || len(sigs) != 1 || len(back.Replaces) != 1 || back.Replaces[0] != named || back.Deadline != a.Deadline {
+		t.Fatalf("decoded %+v, %d sigs, %v", back, len(sigs), err)
 	}
 }
 
