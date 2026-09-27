@@ -18,6 +18,9 @@ package main
 //	candidate:  btcvm-l1 request -node-uri http://127.0.0.1:9650 -owner P-metal1... > request.json
 //	admin 1:    btcvm-l1 approve -request request.json -key admin1-key.json > proposal.json
 //	admin 2:    btcvm-l1 approve -proposal proposal.json -key admin2-key.json > proposal2.json
+//	            (each approve shows the change and what it does to the
+//	            validators' shares, and asks; -yes skips the question. It
+//	            needs no validator node: -node-uri only reads the P-Chain.)
 //	submitter:  btcvm-l1 submit -proposal proposal2.json -node-uri http://127.0.0.1:9660 \
 //	              -rpc-pass-file rpc-password > registration.json
 //	candidate:  btcvm-l1 register -registration registration.json -key my-p-chain-key.json -balance 1
@@ -36,6 +39,7 @@ package main
 // message. Each party's private key stays in its own key file.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -46,6 +50,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -185,11 +190,15 @@ func cmdRequest(args []string) error {
 // Warp message and the approvals so far. Every field but the message and
 // the approvals is a label, recomputed from the message whenever it's read.
 type proposal struct {
-	Change          string   `json:"change"` // "register" or "set-weight"
-	Summary         string   `json:"summary"`
-	UnsignedMessage string   `json:"unsignedMessage"`
-	Approvals       []string `json:"approvals"`
-	ApprovedBy      []string `json:"approvedBy"`
+	Change          string `json:"change"` // "register" or "set-weight"
+	Summary         string `json:"summary"`
+	UnsignedMessage string `json:"unsignedMessage"`
+	// Every approval is of the message until this time (Unix seconds); the
+	// validators refuse approvals past it.
+	Deadline    uint64   `json:"deadline"`
+	DeadlineUTC string   `json:"deadlineUTC"`
+	Approvals   []string `json:"approvals"`
+	ApprovedBy  []string `json:"approvedBy"`
 	// For a registration: what the candidate needs to register.
 	NodeID               string `json:"nodeID,omitempty"`
 	ValidationID         string `json:"validationID,omitempty"`
@@ -266,17 +275,27 @@ func (c *change) label(p *proposal) error {
 	return nil
 }
 
-// check refuses a registration that has expired: nobody could register it.
-func (c *change) check() error {
+// check refuses a change nobody could still make: a registration past its
+// expiry, or approvals past their deadline.
+func (c *change) check(p *proposal) error {
 	if c.reg != nil && time.Now().Unix() >= int64(c.reg.Expiry) {
 		return fmt.Errorf("this registration expired at %s; start a new one", time.Unix(int64(c.reg.Expiry), 0).UTC().Format(time.RFC3339))
+	}
+	if p.Deadline == 0 || uint64(time.Now().Unix()) >= p.Deadline {
+		return fmt.Errorf("this proposal's approvals expired at %s; start a new one", time.Unix(int64(p.Deadline), 0).UTC().Format(time.RFC3339))
 	}
 	return nil
 }
 
+// setDeadline fixes the time every approval of the proposal is good until.
+func (p *proposal) setDeadline(t time.Time) {
+	p.Deadline = uint64(t.Unix())
+	p.DeadlineUTC = t.UTC().Format(time.RFC3339)
+}
+
 // approvals decodes a proposal's approvals and who gave each.
 func (p *proposal) approvals(unsigned *warp.UnsignedMessage) ([][]byte, []ids.ShortID, error) {
-	hash := vm.ApprovalHash(unsigned.Bytes())
+	hash := vm.ApprovalHash(unsigned.Bytes(), p.Deadline)
 	var sigs [][]byte
 	var who []ids.ShortID
 	for i, a := range p.Approvals {
@@ -308,7 +327,7 @@ func (p *proposal) addApproval(unsigned *warp.UnsignedMessage, networkID uint32,
 			return errors.New("this key has already approved this change")
 		}
 	}
-	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes()))
+	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes(), p.Deadline))
 	if err != nil {
 		return err
 	}
@@ -342,6 +361,7 @@ func readProposal(path string, networkID uint32, chainID ids.ID) (*proposal, *ch
 	if err := c.label(&p); err != nil {
 		return nil, nil, err
 	}
+	p.setDeadline(time.Unix(int64(p.Deadline), 0))
 	if _, _, err := p.approvals(c.unsigned); err != nil {
 		return nil, nil, err
 	}
@@ -350,12 +370,12 @@ func readProposal(path string, networkID uint32, chainID ids.ID) (*proposal, *ch
 
 // collect has the validator node at nodeURI collect the L1 validators'
 // signatures on an approved change.
-func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, approvals [][]byte) (*warp.Message, error) {
+func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, deadline uint64, approvals [][]byte) (*warp.Message, error) {
 	pass, err := os.ReadFile(rpcPassFile)
 	if err != nil {
 		return nil, fmt.Errorf("-rpc-pass-file: %w", err)
 	}
-	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(bytes.Join(approvals, nil))})
+	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(vm.EncodeJustification(deadline, approvals))})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(nodeURI, "/")+"/ext/bc/"+chainID.String()+"/validators", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -379,8 +399,16 @@ func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsign
 	if err != nil {
 		return nil, err
 	}
+	msg, err := warp.ParseMessage(signed)
+	if err != nil {
+		return nil, err
+	}
+	// What came back must be exactly what the admins approved.
+	if !bytes.Equal(msg.UnsignedMessage.Bytes(), unsigned.Bytes()) {
+		return nil, errors.New("the node returned a signed message that isn't the approved one; not using it")
+	}
 	fmt.Fprintf(os.Stderr, "signed by weight %s of %s\n", reply.SignedWeight, reply.TotalWeight)
-	return warp.ParseMessage(signed)
+	return msg, nil
 }
 
 // submitFlags are how a proposal reaches the validators.
@@ -404,7 +432,7 @@ func addSubmitFlags(fs *flag.FlagSet, optional bool) submitFlags {
 // printed for the candidate to register; a weight change is issued on the
 // P-Chain at once, paid by -payer-key.
 func submit(p *proposal, c *change, nodeURI string, chainID ids.ID, f submitFlags) error {
-	if err := c.check(); err != nil {
+	if err := c.check(p); err != nil {
 		return err
 	}
 	sigs, _, err := p.approvals(c.unsigned)
@@ -414,7 +442,7 @@ func submit(p *proposal, c *change, nodeURI string, chainID ids.ID, f submitFlag
 	if c.weight != nil && *f.payerPath == "" {
 		return errors.New("-payer-key is needed to issue a weight change")
 	}
-	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, sigs)
+	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, p.Deadline, sigs)
 	if err != nil {
 		return err
 	}
@@ -458,6 +486,7 @@ func cmdApprove(args []string) error {
 	keyPath := fs.String("key", "", "an admin key (its P-Chain address is in the validators' validatorAdmins)")
 	weight := fs.Uint64("weight", 100, "with -request: the new validator's weight (the first validator has 100)")
 	valid := fs.Duration("valid-for", 23*time.Hour, "with -request: how long the admins and the candidate have to finish (at most 24h, which the P-Chain counts from when it is registered)")
+	yes := fs.Bool("yes", false, "approve without asking")
 	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
 	if (*requestPath == "") == (*proposalPath == "") || *keyPath == "" {
@@ -491,11 +520,15 @@ func cmdApprove(args []string) error {
 		if err := c.label(p); err != nil {
 			return err
 		}
+		// A registration's approvals are good as long as the registration.
+		p.setDeadline(time.Unix(int64(reg.Expiry), 0))
 	}
-	if err := c.check(); err != nil {
+	if err := c.check(p); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "approving: %s\n", p.Summary)
+	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes); err != nil {
+		return err
+	}
 	if err := p.addApproval(c.unsigned, networkID, *keyPath); err != nil {
 		return err
 	}
@@ -548,6 +581,109 @@ func registrationFor(requestPath string, subnetID ids.ID, weight uint64, expiry 
 	return reg, req.BLSProofOfPossession, err
 }
 
+// confirm shows an admin what they're approving, from the message itself,
+// and what it does to the validators' shares; then asks, unless yes.
+func confirm(p *proposal, c *change, nodeURI string, subnetID ids.ID, yes bool) error {
+	fmt.Fprintf(os.Stderr, "\nThe change:     %s\n", p.Summary)
+	fmt.Fprintf(os.Stderr, "Approvals until: %s\n", p.DeadlineUTC)
+	if len(p.ApprovedBy) > 0 {
+		fmt.Fprintf(os.Stderr, "Approved by:     %s\n", strings.Join(p.ApprovedBy, ", "))
+	}
+	if lines, err := shareReport(c, nodeURI, subnetID); err != nil {
+		fmt.Fprintf(os.Stderr, "(couldn't read the L1's validators from %s: %s)\n", nodeURI, err)
+	} else {
+		fmt.Fprint(os.Stderr, lines)
+	}
+	if yes {
+		return nil
+	}
+	fmt.Fprint(os.Stderr, "\nApprove this change? Type yes: ")
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if strings.TrimSpace(answer) != "yes" {
+		return errors.New("not approved")
+	}
+	return nil
+}
+
+// shareReport is the L1's validators before and after the change, and how
+// many of the largest could be offline with the rest still at 67%.
+func shareReport(c *change, nodeURI string, subnetID ids.ID) (string, error) {
+	vdrs, err := platformvm.NewClient(nodeURI).GetCurrentValidators(context.Background(), subnetID, nil)
+	if err != nil {
+		return "", err
+	}
+	type row struct {
+		id     string
+		before uint64
+		after  uint64
+	}
+	var rows []row
+	var subject string
+	if c.reg != nil {
+		subject = c.reg.ValidationID().String()
+	} else {
+		subject = c.weight.ValidationID.String()
+	}
+	found := false
+	for _, v := range vdrs {
+		if v.ValidationID == nil {
+			continue
+		}
+		r := row{id: v.NodeID.String(), before: v.Weight, after: v.Weight}
+		if c.weight != nil && v.ValidationID.String() == subject {
+			found = true
+			r.after = c.weight.Weight
+		}
+		rows = append(rows, r)
+	}
+	if c.reg != nil {
+		nodeID, _ := ids.ToNodeID(c.reg.NodeID)
+		rows = append(rows, row{id: nodeID.String() + " (new)", after: c.reg.Weight})
+	} else if !found {
+		return "", fmt.Errorf("validation %s is not one of this L1's current validators", subject)
+	}
+	var before, after uint64
+	var weights []uint64
+	for _, r := range rows {
+		before += r.before
+		after += r.after
+		if r.after > 0 {
+			weights = append(weights, r.after)
+		}
+	}
+	pct := func(w, total uint64) string {
+		if total == 0 {
+			return "-"
+		}
+		return fmt.Sprintf("%.1f%%", float64(w)*100/float64(total))
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n%-44s %14s %14s\n", "Validator", "share before", "share after")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%-44s %14s %14s\n", r.id, pct(r.before, before), pct(r.after, after))
+	}
+	sort.Slice(weights, func(i, j int) bool { return weights[i] > weights[j] })
+	offline, left := 0, after
+	for _, w := range weights {
+		if (left-w)*100 < after*67 {
+			break
+		}
+		offline++
+		left -= w
+	}
+	fmt.Fprintf(&b, "After it, %d validator(s) can be offline and the rest still reach the 67%% the P-Chain needs.\n", offline)
+	if offline == 0 {
+		b.WriteString("WARNING: with any one validator offline, the L1's validators can't be changed again until it's back.\n")
+	}
+	for _, w := range weights {
+		if w*3 >= after {
+			b.WriteString("A validator would hold a third or more of the weight: the validators sign this only with every admin's approval.\n")
+			break
+		}
+	}
+	return b.String(), nil
+}
+
 // cmdSubmit has the validators sign a proposal with enough approvals.
 func cmdSubmit(args []string) error {
 	fs := flag.NewFlagSet("submit", flag.ExitOnError)
@@ -587,9 +723,13 @@ func cmdRegister(args []string) error {
 	uri := fs.String("uri", "http://127.0.0.1:9650", "a node's API, for the P-Chain")
 	balance := fs.Float64("balance", 1, "METAL for the validator's continuous P-Chain fee")
 	otherNode := fs.Bool("other-node", false, "register it even though it isn't for the node at -uri")
+	lowBalance := fs.Bool("low-balance", false, "allow a starting balance under 1 METAL (under a month of fees)")
 	_ = fs.Parse(args)
 	if *regPath == "" || *keyPath == "" {
 		return errors.New("-registration and -key are required")
+	}
+	if *balance < 1 && !*lowBalance {
+		return errors.New("-balance under 1 METAL runs out in a few weeks, and the validator stops counting; -low-balance allows it")
 	}
 	var reg registration
 	if err := readJSON(*regPath, &reg); err != nil {
@@ -618,6 +758,21 @@ func cmdRegister(args []string) error {
 		}
 		if mine != nodeID || pop == nil || pop.PublicKey != inner.BLSPublicKey {
 			return fmt.Errorf("this registration is for %s, not the node at -uri (%s); -other-node registers it anyway", nodeID, mine)
+		}
+		// A validator counts from the moment it's registered: it must
+		// already be caught up on the P-Chain and the L1, ready to sign.
+		msg, err := warp.ParseMessage(signed)
+		if err != nil {
+			return err
+		}
+		for _, chain := range []string{"P", msg.UnsignedMessage.SourceChainID.String()} {
+			done, err := info.NewClient(*uri).IsBootstrapped(context.Background(), chain)
+			if err != nil {
+				return fmt.Errorf("asking the node whether it has bootstrapped %s: %w", chain, err)
+			}
+			if !done {
+				return fmt.Errorf("the node hasn't finished bootstrapping %s; register once it has (sudo ./setup.sh --status)", chain)
+			}
 		}
 	}
 	popBytes, err := unhex(reg.BLSProofOfPossession, "blsProofOfPossession")
@@ -656,12 +811,17 @@ func cmdRemove(args []string) error {
 	l1 := addL1Flags(fs)
 	validationFlag := fs.String("validation-id", "", "the validator's validation ID (btcvm-l1 validators)")
 	keyPath := fs.String("key", "", "an admin key")
+	valid := fs.Duration("valid-for", 72*time.Hour, "how long the other admins have to approve (at most "+vm.MaxApprovalLife.String()+")")
+	yes := fs.Bool("yes", false, "approve without asking")
 	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
 	if *validationFlag == "" || *keyPath == "" {
 		return errors.New("-validation-id and -key are required")
 	}
-	chainID, _, err := l1.ids()
+	if *valid <= 0 || *valid > vm.MaxApprovalLife {
+		return fmt.Errorf("-valid-for must be between 0 and %s", vm.MaxApprovalLife)
+	}
+	chainID, subnetID, err := l1.ids()
 	if err != nil {
 		return err
 	}
@@ -687,7 +847,10 @@ func cmdRemove(args []string) error {
 	if err := c.label(p); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "approving: %s\n", p.Summary)
+	p.setDeadline(time.Now().Add(*valid))
+	if err := confirm(p, c, *l1.nodeURI, subnetID, *yes); err != nil {
+		return err
+	}
 	if err := p.addApproval(unsigned, networkID, *keyPath); err != nil {
 		return err
 	}

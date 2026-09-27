@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	log "github.com/inconshreveable/log15"
 )
@@ -30,20 +29,16 @@ type config struct {
 	ShowVersion bool
 }
 
-// defaultConfig returns a config with default values
+// defaultConfig returns a config with default values.
+//
+// metalgo starts the plugin with an empty environment (no HOME) in its own
+// working directory, so the plugin writes nothing by default: it logs to
+// stderr, which metalgo keeps in its own logs, and the chain's data and logs
+// live where the chain config says (dataDir, logDir), set up in Initialize.
+// -datadir and -logdir are for running it by hand.
 func defaultConfig() *config {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		homeDir = "."
-	}
-
-	defaultDataDir := filepath.Join(homeDir, ".btcvm")
-	defaultLogDir := filepath.Join(defaultDataDir, "logs")
-
 	return &config{
 		LogLevel:    "info",
-		LogDir:      defaultLogDir,
-		DataDir:     defaultDataDir,
 		CPUProfile:  "",
 		MemProfile:  "",
 		HTTPProfile: "",
@@ -96,12 +91,13 @@ func (c *config) validate() error {
 		return fmt.Errorf("invalid log level: %s (valid: %v)", c.LogLevel, validLevels)
 	}
 
-	// Ensure directories exist
-	dirs := []string{c.DataDir}
-	if c.LogDir != "" {
-		dirs = append(dirs, c.LogDir)
+	// Directories asked for on the command line must exist.
+	var dirs []string
+	for _, dir := range []string{c.DataDir, c.LogDir} {
+		if dir != "" {
+			dirs = append(dirs, dir)
+		}
 	}
-
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)

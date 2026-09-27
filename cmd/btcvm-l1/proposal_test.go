@@ -60,6 +60,10 @@ func TestProposalApprovals(t *testing.T) {
 	if err := c.label(p); err != nil {
 		t.Fatal(err)
 	}
+	p.setDeadline(time.Now().Add(time.Hour))
+	if err := c.check(p); err != nil {
+		t.Fatal(err)
+	}
 	admin1, admin2 := writeKey(t, dir, "a1.json"), writeKey(t, dir, "a2.json")
 	if err := p.addApproval(unsigned, netID, admin1); err != nil {
 		t.Fatal(err)
@@ -89,6 +93,16 @@ func TestProposalApprovals(t *testing.T) {
 	if _, _, err := readProposal(writeProposal(t, dir, read), netID, ids.GenerateTestID()); err == nil {
 		t.Fatal("read a proposal for another chain")
 	}
+	// A deadline moved after approving invalidates the approvals.
+	moved := *read
+	moved.Deadline += 60
+	if _, _, err := readProposal(writeProposal(t, dir, &moved), netID, chainID); err != nil {
+		t.Fatal(err) // they still recover to some key...
+	}
+	_, movedWho, _ := moved.approvals(rc.unsigned)
+	if movedWho[0] == who[0] || movedWho[1] == who[1] {
+		t.Fatal("approvals still verify as the admins' after the deadline moved")
+	}
 	// A corrupted approval is refused.
 	read.Approvals[1] = read.Approvals[1][:len(read.Approvals[1])-2] + "zz"
 	if _, _, err := readProposal(writeProposal(t, dir, read), netID, chainID); err == nil {
@@ -102,7 +116,14 @@ func TestExpiredRegistrationRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := (&change{reg: reg}).check(); err == nil || !strings.Contains(err.Error(), "expired") {
+	future := &proposal{}
+	future.setDeadline(time.Now().Add(time.Hour))
+	if err := (&change{reg: reg}).check(future); err == nil || !strings.Contains(err.Error(), "registration expired") {
 		t.Fatalf("expired registration: %v", err)
+	}
+	past := &proposal{}
+	past.setDeadline(time.Now().Add(-time.Second))
+	if err := (&change{}).check(past); err == nil || !strings.Contains(err.Error(), "approvals expired") {
+		t.Fatalf("expired approvals: %v", err)
 	}
 }

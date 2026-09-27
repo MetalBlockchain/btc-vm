@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MetalBlockchain/metalgo/ids"
@@ -22,6 +24,7 @@ import (
 	"github.com/MetalBlockchain/metalgo/network/p2p/acp118"
 	"github.com/MetalBlockchain/metalgo/proto/pb/sdk"
 	"github.com/MetalBlockchain/metalgo/snow/engine/common"
+	"github.com/MetalBlockchain/metalgo/snow/validators"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/formatting/address"
@@ -43,12 +46,19 @@ import (
 // Each validator signs such a message only when enough of the admins in its
 // chain config approved it: proof of authority, M of N. The admins are
 // "validatorAdmins" (P-Chain addresses); M is "validatorAdminThreshold",
-// by default a majority of them. An approval is an admin key's signature
-// over ApprovalHash(message); the ACP-118 justification is M or more such
-// signatures, one after another, each by a different admin. So no one
-// admin key can change the validator set alone. Signing is node policy,
-// not consensus: blocks and their validity are unchanged, and a node with
-// no admins configured signs nothing.
+// by default a majority of them, and never 1 when there are several. An
+// approval is an admin key's signature over ApprovalHash(message,
+// deadline); the ACP-118 justification (EncodeJustification) carries the
+// deadline and M or more approvals, each by a different admin. So no one
+// admin key can change the validator set alone, and approvals expire.
+//
+// A change is also checked against the L1's current validators: a weight
+// change must be for one of them, the last one can't be removed, and a
+// change that leaves any validator with a third or more of the weight
+// (enough to block the 67% quorum alone) needs every admin.
+//
+// Signing is node policy, not consensus: blocks and their validity are
+// unchanged, and a node with no admins configured signs nothing.
 
 // ApprovalDomain prefixes what an admin signs, so an approval can never be
 // mistaken for any other signature made with the same key (a P-Chain
@@ -58,12 +68,65 @@ const ApprovalDomain = "Metal L1 validator change, approved\x00"
 // Signing a request, or answering one, gives up after this long.
 const aggregateTimeout = 30 * time.Second
 
-// ApprovalHash is what an admin signs to approve an unsigned Warp message.
-func ApprovalHash(unsignedMessage []byte) []byte {
+// ApprovalVersion is the format of an approval and of the justification
+// that carries approvals.
+const ApprovalVersion byte = 1
+
+// MaxApprovalLife bounds how far ahead an approval's deadline can be: long
+// enough for admins to sign in turn, short enough that a forgotten
+// approval dies.
+const MaxApprovalLife = 7 * 24 * time.Hour
+
+// justificationHeader is the version byte and the 8-byte deadline.
+const justificationHeader = 1 + 8
+
+// ApprovalHash is what every admin signs to approve an unsigned Warp message
+// until deadline (Unix seconds):
+//
+//	sha256(ApprovalDomain || ApprovalVersion || deadline, 8 bytes big-endian || unsigned message)
+func ApprovalHash(unsignedMessage []byte, deadline uint64) []byte {
 	h := sha256.New()
 	h.Write([]byte(ApprovalDomain))
+	h.Write([]byte{ApprovalVersion})
+	var d [8]byte
+	binary.BigEndian.PutUint64(d[:], deadline)
+	h.Write(d[:])
 	h.Write(unsignedMessage)
 	return h.Sum(nil)
+}
+
+// EncodeJustification is the ACP-118 justification for approvals of one
+// message, all with the same deadline:
+//
+//	ApprovalVersion || deadline, 8 bytes big-endian || approval (65 bytes) ...
+func EncodeJustification(deadline uint64, approvals [][]byte) []byte {
+	out := make([]byte, justificationHeader, justificationHeader+len(approvals)*secp256k1.SignatureLen)
+	out[0] = ApprovalVersion
+	binary.BigEndian.PutUint64(out[1:], deadline)
+	for _, a := range approvals {
+		out = append(out, a...)
+	}
+	return out
+}
+
+func decodeJustification(b []byte) (uint64, [][]byte, error) {
+	if len(b) < justificationHeader {
+		return 0, nil, errors.New("the change carries no admin approvals")
+	}
+	if b[0] != ApprovalVersion {
+		return 0, nil, fmt.Errorf("approval format %d; this node reads format %d", b[0], ApprovalVersion)
+	}
+	deadline := binary.BigEndian.Uint64(b[1:justificationHeader])
+	rest := b[justificationHeader:]
+	if len(rest) == 0 || len(rest)%secp256k1.SignatureLen != 0 {
+		return 0, nil, errors.New("the change carries no whole admin approvals (each is a 65-byte signature)")
+	}
+	var sigs [][]byte
+	for len(rest) > 0 {
+		sigs = append(sigs, rest[:secp256k1.SignatureLen])
+		rest = rest[secp256k1.SignatureLen:]
+	}
+	return deadline, sigs, nil
 }
 
 // validatorAdminsConfig is the part of the chain config the manager reads.
@@ -111,6 +174,10 @@ func parseValidatorAdmins(configBytes []byte) (adminPolicy, error) {
 		return adminPolicy{}, errors.New("validatorAdminThreshold is set but validatorAdmins is empty")
 	case *cfg.ValidatorAdminThreshold < 1 || *cfg.ValidatorAdminThreshold > n:
 		return adminPolicy{}, fmt.Errorf("validatorAdminThreshold %d must be between 1 and the %d validatorAdmins", *cfg.ValidatorAdminThreshold, n)
+	case n > 1 && *cfg.ValidatorAdminThreshold < 2:
+		// Several admins with a threshold of 1 is 1-of-N: any one stolen
+		// key changes the validator set.
+		return adminPolicy{}, fmt.Errorf("validatorAdminThreshold 1 with %d validatorAdmins would let any one of them change the validators alone; use at least 2", n)
 	default:
 		p.threshold = *cfg.ValidatorAdminThreshold
 	}
@@ -121,9 +188,46 @@ func parseValidatorAdmins(configBytes []byte) (adminPolicy, error) {
 }
 
 type validatorManager struct {
-	vm     *VM
-	policy adminPolicy
-	client *p2p.Client
+	vm      *VM
+	policy  adminPolicy
+	client  *p2p.Client
+	limiter *rateLimiter
+	now     func() time.Time
+}
+
+// Signature requests are unauthenticated peer messages, each costing a
+// P-Chain read and signature recoveries: at most this many a second, with
+// bursts of verifyBurst.
+const (
+	verifyRate  = 10
+	verifyBurst = 50
+)
+
+// rateLimiter is a token bucket.
+type rateLimiter struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+	rate   float64
+	burst  float64
+}
+
+func newRateLimiter(rate, burst float64) *rateLimiter {
+	return &rateLimiter{tokens: burst, rate: rate, burst: burst}
+}
+
+func (l *rateLimiter) allow(now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.last.IsZero() {
+		l.tokens = min(l.burst, l.tokens+now.Sub(l.last).Seconds()*l.rate)
+	}
+	l.last = now
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
 }
 
 var _ acp118.Verifier = (*validatorManager)(nil)
@@ -131,6 +235,7 @@ var _ acp118.Verifier = (*validatorManager)(nil)
 const (
 	errCodeNotManaged = iota + 1
 	errCodeNotApproved
+	errCodeBusy
 )
 
 func appError(code int32, format string, args ...any) *common.AppError {
@@ -141,9 +246,12 @@ func appError(code int32, format string, args ...any) *common.AppError {
 // validator registration for this L1, or a validator weight change (weight
 // 0 removes a validator), from this chain as the L1's manager, approved by
 // at least the threshold of admins.
-func (m *validatorManager) Verify(_ context.Context, msg *warp.UnsignedMessage, justification []byte) *common.AppError {
-	ctx := m.vm.ctx
-	if msg.NetworkID != ctx.NetworkID || msg.SourceChainID != ctx.ChainID {
+func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage, justification []byte) *common.AppError {
+	if m.limiter != nil && !m.limiter.allow(m.clock()) {
+		return appError(errCodeBusy, "too many signature requests; try again shortly")
+	}
+	snowCtx := m.vm.ctx
+	if msg.NetworkID != snowCtx.NetworkID || msg.SourceChainID != snowCtx.ChainID {
 		return appError(errCodeNotManaged, "message is for network %d chain %s, not this chain", msg.NetworkID, msg.SourceChainID)
 	}
 	call, err := payload.ParseAddressedCall(msg.Payload)
@@ -161,47 +269,124 @@ func (m *validatorManager) Verify(_ context.Context, msg *warp.UnsignedMessage, 
 	}
 	switch p := parsed.(type) {
 	case *message.RegisterL1Validator:
-		if p.SubnetID != ctx.SubnetID {
-			return appError(errCodeNotManaged, "registration is for subnet %s, not this L1's %s", p.SubnetID, ctx.SubnetID)
+		if p.SubnetID != snowCtx.SubnetID {
+			return appError(errCodeNotManaged, "registration is for subnet %s, not this L1's %s", p.SubnetID, snowCtx.SubnetID)
 		}
 		if p.Weight == 0 {
 			return appError(errCodeNotManaged, "a registration needs a weight above 0")
 		}
 	case *message.L1ValidatorWeight:
-		// The P-Chain checks that the validation belongs to this L1 (its
-		// manager is this chain) and that the nonce is fresh.
+		// checkChange checks the validation is this L1's; the P-Chain checks
+		// the nonce is fresh.
 	default:
 		return appError(errCodeNotManaged, "this chain signs validator registrations and weight changes only, not %T", parsed)
 	}
 	if m.policy.admins.Len() == 0 {
 		return appError(errCodeNotApproved, "this node has no validatorAdmins in its chain config, so it approves no validator changes")
 	}
-	approvers, err := m.policy.approvers(msg.Bytes(), justification)
+	approvers, err := m.policy.approvers(msg.Bytes(), justification, m.clock())
 	if err != nil {
 		return appError(errCodeNotApproved, "%s", err)
 	}
 	if approvers.Len() < m.policy.threshold {
 		return appError(errCodeNotApproved, "approved by %d of this L1's admins; it needs %d", approvers.Len(), m.policy.threshold)
 	}
+	current, _, err := snowCtx.ValidatorState.GetCurrentValidatorSet(ctx, snowCtx.SubnetID)
+	if err != nil {
+		return appError(errCodeNotManaged, "reading the L1's validators: %s", err)
+	}
+	return m.policy.checkChange(parsed, current, approvers.Len())
+}
+
+func (m *validatorManager) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// checkChange checks what an approved change does to the L1's current
+// validators (keyed by validation ID; only active ones count toward the
+// weight, as in the P-Chain's quorum).
+func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*validators.GetCurrentValidatorOutput, approvals int) *common.AppError {
+	weights := map[ids.ID]uint64{}
+	for id, v := range current {
+		if v.IsActive {
+			weights[id] = v.Weight
+		}
+	}
+	var subject ids.ID
+	switch c := change.(type) {
+	case *message.RegisterL1Validator:
+		subject = c.ValidationID()
+		if _, ok := current[subject]; ok {
+			return appError(errCodeNotManaged, "validation %s is already registered", subject)
+		}
+		for _, v := range current {
+			if bytes.Equal(v.NodeID[:], c.NodeID) {
+				return appError(errCodeNotManaged, "%s already validates this L1", v.NodeID)
+			}
+		}
+		weights[subject] = c.Weight
+	case *message.L1ValidatorWeight:
+		subject = c.ValidationID
+		if _, ok := current[subject]; !ok {
+			return appError(errCodeNotManaged, "validation %s is not one of this L1's validators", subject)
+		}
+		if c.Weight == 0 {
+			delete(weights, subject)
+			if len(weights) == 0 {
+				return appError(errCodeNotManaged, "that would remove the L1's last active validator")
+			}
+		} else {
+			weights[subject] = c.Weight
+		}
+	}
+	total, largest := new(big.Int), uint64(0)
+	for _, w := range weights {
+		total.Add(total, new(big.Int).SetUint64(w))
+		largest = max(largest, w)
+	}
+	// largest * 3 >= total: one validator could block the 67% quorum alone.
+	if new(big.Int).Mul(new(big.Int).SetUint64(largest), big.NewInt(3)).Cmp(total) >= 0 && approvals < p.admins.Len() {
+		return appError(errCodeNotApproved,
+			"after this change one validator holds %s of the L1's weight (a third or more), which needs all %d admins; %d approved",
+			share(largest, total), p.admins.Len(), approvals)
+	}
 	return nil
+}
+
+// share is w as a percentage of total, e.g. "33.3%".
+func share(w uint64, total *big.Int) string {
+	if total.Sign() == 0 {
+		return "100%"
+	}
+	r := new(big.Rat).SetFrac(new(big.Int).Mul(new(big.Int).SetUint64(w), big.NewInt(100)), total)
+	f, _ := r.Float64()
+	return fmt.Sprintf("%.1f%%", f)
 }
 
 // approvers checks every approval in a justification and returns the admins
 // who gave them. An approval from a key that isn't an admin, a second one
 // from the same admin, or a justification that isn't whole approvals
 // refuses the lot: a well-formed request never has them.
-func (p adminPolicy) approvers(unsignedMessage, justification []byte) (set.Set[ids.ShortID], error) {
-	n := len(justification) / secp256k1.SignatureLen
-	if n == 0 || len(justification)%secp256k1.SignatureLen != 0 {
-		return nil, errors.New("the change carries no admin approvals (each is a 65-byte signature)")
+func (p adminPolicy) approvers(unsignedMessage, justification []byte, now time.Time) (set.Set[ids.ShortID], error) {
+	deadline, sigs, err := decodeJustification(justification)
+	if err != nil {
+		return nil, err
 	}
-	if n > p.admins.Len() {
-		return nil, fmt.Errorf("%d approvals, but this L1 has only %d admins", n, p.admins.Len())
+	switch at := time.Unix(int64(deadline), 0); {
+	case deadline > uint64(now.Add(MaxApprovalLife).Unix()):
+		return nil, fmt.Errorf("the approvals' deadline %s is more than %s away", at.UTC().Format(time.RFC3339), MaxApprovalLife)
+	case uint64(now.Unix()) > deadline:
+		return nil, fmt.Errorf("the approvals expired at %s", at.UTC().Format(time.RFC3339))
 	}
-	hash := ApprovalHash(unsignedMessage)
-	approvers := set.NewSet[ids.ShortID](n)
-	for i := range n {
-		sig := justification[i*secp256k1.SignatureLen : (i+1)*secp256k1.SignatureLen]
+	if len(sigs) > p.admins.Len() {
+		return nil, fmt.Errorf("%d approvals, but this L1 has only %d admins", len(sigs), p.admins.Len())
+	}
+	hash := ApprovalHash(unsignedMessage, deadline)
+	approvers := set.NewSet[ids.ShortID](len(sigs))
+	for i, sig := range sigs {
 		pub, err := secp256k1.RecoverPublicKeyFromHash(hash, sig)
 		if err != nil {
 			return nil, fmt.Errorf("approval %d: %w", i+1, err)
@@ -427,7 +612,7 @@ func containsNode(nodeIDs []ids.NodeID, want ids.NodeID) bool {
 // newValidatorManager registers the ACP-118 signature handler on the VM's
 // p2p network and a client for collecting signatures.
 func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy) (*validatorManager, error) {
-	m := &validatorManager{vm: vm, policy: policy}
+	m := &validatorManager{vm: vm, policy: policy, limiter: newRateLimiter(verifyRate, verifyBurst)}
 	if err := network.AddHandler(acp118.HandlerID, acp118.NewHandler(m, vm.ctx.WarpSigner)); err != nil {
 		return nil, fmt.Errorf("registering the signature handler: %w", err)
 	}
@@ -465,6 +650,10 @@ func (m *validatorManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := m.vm.config
+	if cfg.RPCPass == "public" || len(cfg.RPCPass) < 16 {
+		fail(http.StatusForbidden, "this chain's rpcPass is too weak to guard signature collection (at least 16 characters, not \"public\")")
+		return
+	}
 	user, pass, ok := r.BasicAuth()
 	if cfg.RPCUser == "" || cfg.RPCPass == "" || !ok ||
 		subtle.ConstantTimeCompare([]byte(user), []byte(cfg.RPCUser)) != 1 ||
