@@ -16,7 +16,8 @@
 #    until it's active, so nodes 2 and 3 join at weight 1 and are raised to
 #    100 once active (a raise needs the raised node's own signature); with
 #    up to three validators one could block the 67% alone, so those changes
-#    need all three admins. Node 4 joins at 100 (25% each) with two.
+#    need all three admins. Node 4 joins at 1 too (all three admins) and is
+#    raised to 100 with two: 4 x 100 tolerates one validator down.
 # 4. Sends payments until each of the four validators has built blocks and
 #    been paid their fees; node 5, not a validator, builds none.
 # 5. Removes node 3: two admins are refused (it leaves 33.3% each), all
@@ -124,6 +125,8 @@ for i in $(seq $N); do mkdir -p "$DIR/n$i/chain-configs"; done
   go build -o "$DIR/bin/btcvm-l1" ./cmd/btcvm-l1
   go build -o "$DIR/bin/btcvm-devnet" ./cmd/btcvm-devnet
 )
+# The tools write files (a proposal they submit) where they run: here.
+cd "$DIR"
 BIN=$DIR/bin
 NODE1_ID=$("$BIN/btcvm-l1" node-id -cert "$STAKING/staker1.crt")
 start_all
@@ -202,7 +205,7 @@ submit() {
 }
 submit_and_register() { # NODE
   submit "$DIR/proposal$1.json" "$DIR/registration$1.json" || return 1
-  "$BIN/btcvm-l1" register -registration "$DIR/registration$1.json" -key "$DIR/ewoq.json" \
+  "$BIN/btcvm-l1" register -yes -registration "$DIR/registration$1.json" -key "$DIR/ewoq.json" \
     -uri "$(uri "$1")" -balance 1 >"$DIR/registered$1.json"
 }
 add_validator() { # NODE WEIGHT ADMIN...: admin 1 starts the proposal, the others follow
@@ -250,8 +253,11 @@ add_validator 2 1 2 3
 raise 2 100 2 3
 add_validator 3 1 2 3
 raise 3 100 2 3
-# 3 -> 4 at 100: 300 of 400 can sign, 25% each: two admins are enough.
-add_validator 4 100 2
+# A fourth joins small too (without any one of the three, 200 of 301 can't
+# sign), with every admin; raised to 100 once it signs, 4 x 100 tolerates
+# one validator down, so two admins are enough for the raise.
+add_validator 4 1 2 3
+raise 4 100 2
 [[ $(validator_count) == 4 ]] || fail "expected 4 validators, got $(validator_count)"
 
 # --- 4. Blocks and fees ---------------------------------------------------------------
@@ -368,12 +374,13 @@ ok "an admin plus an outsider refused: $(tail -1 "$DIR/err4.txt" | cut -c1-110)"
 if "$BIN/btcvm-l1" approve "${L1[@]}" -proposal "$DIR/proposal5.json" -key "$DIR/admin1.json" -yes >/dev/null 2>"$DIR/err4.txt"; then
   fail "one admin approved the same change twice"
 fi
+grep -q "already approved" "$DIR/err4.txt" || fail "unexpected refusal: $(cat "$DIR/err4.txt")"
 ok "an admin can't approve twice"
 # 3 validators at 100 plus one at 300: only half the weight could sign.
 "$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request5.json" -key "$DIR/admin1.json" -weight 300 -yes >"$DIR/heavy5.json"
-approvals "$DIR/heavy5.json" 2
+approvals "$DIR/heavy5.json" 2 3
 if submit "$DIR/heavy5.json" "$DIR/out5.json" 2>"$DIR/err6.txt"; then
-  fail "two admins added a validator with 50% of the weight"
+  fail "every admin added a validator with 50% of the weight"
 fi
 grep -q "able to sign hold" "$DIR/err6.txt" || fail "unexpected refusal: $(cat "$DIR/err6.txt")"
 ok "a heavy newcomer is refused: $(grep -o 'after this change[^;]*' "$DIR/err6.txt" | head -1)"
@@ -382,6 +389,7 @@ if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/propo
   -key "$DIR/admin2.json" -rpc-pass-file "$DIR/wrong-password" >/dev/null 2>"$DIR/err5.txt"; then
   fail "the signing endpoint answered without the chain's RPC login"
 fi
+grep -q "needs the chain's rpcUser and rpcPass" "$DIR/err5.txt" || fail "unexpected refusal: $(cat "$DIR/err5.txt")"
 ok "signing endpoint needs the RPC login"
 [[ $(validator_count) == 3 ]] || fail "validator count changed"
 
@@ -391,7 +399,7 @@ log "Validators sign one change at a time"
 # the P-Chain or expires, the validators sign no other change, so changes
 # approved one by one can't be gathered and submitted together.
 "$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request5.json" -key "$DIR/admin1.json" -yes -offline >"$DIR/pending5.json"
-approvals "$DIR/pending5.json" 2
+approvals "$DIR/pending5.json" 2 3
 submit "$DIR/pending5.json" "$DIR/signed5.json" || fail "node 5's registration wasn't signed"
 N4=$(jq -r .validationID "$DIR/registration4.json")
 "$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N4" -key "$DIR/admin1.json" -yes >"$DIR/remove4.json"

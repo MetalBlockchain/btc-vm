@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,8 +126,16 @@ func parseGenesisBytes(data []byte) (*genesisBytes, error) {
 }
 
 // consensusConfigKeys are genesis settings every node must agree on, which a
-// node's chain config may not override.
-var consensusConfigKeys = []string{"mainNet", "testNet", "pegReserveAddress", "pegReserveBlocks"}
+// node's chain config may not override: the network, the peg reserve, and
+// checkpoints (a checkpoint skips script checks below it).
+var consensusConfigKeys = []string{
+	"mainNet", "testNet", "regressionTest", "simNet", "sigNet", "sigNetChallenge",
+	"pegReserveAddress", "pegReserveBlocks", "addCheckpoints",
+}
+
+// refusedConfigKeys aren't consensus but have no place in a chain config: at
+// every start they'd drop an index.
+var refusedConfigKeys = []string{"dropAddrIndex", "dropTxIndex", "dropCfIndex"}
 
 // applyChainConfig overlays the node's chain config (JSON with the same keys
 // as the genesis "config" object) onto the genesis config.
@@ -139,9 +148,18 @@ func applyChainConfig(genesisConfig *btcd.Config, configBytes []byte) error {
 	if err := json.Unmarshal(configBytes, &keys); err != nil {
 		return err
 	}
-	for _, key := range consensusConfigKeys {
-		if _, ok := keys[key]; ok {
-			return fmt.Errorf("%q is a consensus setting and must be set in the genesis", key)
+	// JSON field names match case-insensitively, so the check does too:
+	// "MainNet" would set mainNet.
+	for key := range keys {
+		for _, c := range consensusConfigKeys {
+			if strings.EqualFold(key, c) {
+				return fmt.Errorf("%q is a consensus setting and must be set in the genesis", key)
+			}
+		}
+		for _, r := range refusedConfigKeys {
+			if strings.EqualFold(key, r) {
+				return fmt.Errorf("%q doesn't belong in a chain config (it would act at every start)", key)
+			}
 		}
 	}
 

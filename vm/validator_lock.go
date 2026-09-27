@@ -18,6 +18,9 @@ import (
 type heldChange struct {
 	Message []byte `json:"message"` // the unsigned Warp message
 	Height  uint64 `json:"height"`
+	// Changes every admin replaced, while they could still land: never
+	// signed again.
+	Dropped [][]byte `json:"dropped,omitempty"`
 }
 
 // changeLock keeps the held change in a file of its own, written with fsync

@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	btcd "github.com/MetalBlockchain/btcvm/btcd"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/network/p2p"
 	"github.com/MetalBlockchain/metalgo/network/p2p/acp118"
@@ -61,7 +62,9 @@ import (
 // P-Chain's 67% of the whole registered weight afterwards (a newcomer can't
 // sign until it's funded and online, so an L1 grows by adding a validator
 // at a small weight and raising it once it's active); and a change after
-// which any one BLS key could block that quorum alone needs every admin.
+// which any one BLS key could block that quorum alone (without the active
+// weight it signs for, the rest able to sign wouldn't make 67% of the
+// whole) needs every admin.
 //
 // Changes don't add up behind the policy's back: a node signs one change at
 // a time (changeLock). Until the change it holds is on the P-Chain or can no
@@ -104,6 +107,10 @@ const (
 
 // MaxReplaced bounds the held changes one replacement names.
 const MaxReplaced = 16
+
+// MaxReplaceLife bounds how far ahead a replacement's deadline can be: it
+// names the changes held now, and mustn't be kept for later.
+const MaxReplaceLife = time.Hour
 
 // MaxApprovalLife bounds how far ahead an approval's deadline can be: long
 // enough for admins to sign in turn, short enough that a forgotten
@@ -222,8 +229,12 @@ func majority(n int) int { return n/2 + 1 }
 // CheckChainConfig reports whether the VM would accept a chain config's
 // validator settings (for installers, via the plugin's -check-config).
 func CheckChainConfig(configBytes []byte) error {
-	_, err := parseValidatorAdmins(configBytes)
-	return err
+	if _, err := parseValidatorAdmins(configBytes); err != nil {
+		return err
+	}
+	// The overrides the VM refuses at start (consensus settings, index drops),
+	// applied to an empty config: only the refusals matter here.
+	return applyChainConfig(&btcd.Config{}, configBytes)
 }
 
 // parseValidatorAdmins reads "validatorAdmins" and "validatorAdminThreshold"
@@ -293,7 +304,7 @@ const (
 	peerBurst   = 10
 	globalRate  = 20
 	globalBurst = 100
-	maxPeers    = 10_000 // budgets kept; beyond it they start over
+	maxPeers    = 10_000 // peers with budgets; beyond it, new non-validators are turned away
 )
 
 // limitedHandler rate-limits peers' signature requests: each peer has a
@@ -457,6 +468,15 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 		return appError(errCodeBusy, "%s", err)
 	}
 	same := held != nil && bytes.Equal(held.Message, msg.Bytes())
+	var dropped [][]byte
+	if held != nil {
+		dropped = stillDropped(held.Dropped, current, now)
+		for _, d := range dropped {
+			if bytes.Equal(d, msg.Bytes()) {
+				return appError(errCodeNotApproved, "every admin replaced this change; it isn't signed again")
+			}
+		}
+	}
 	if held != nil && !same && replaceHeld && !names(approval.Replaces, HeldHash(held.Message)) {
 		return appError(errCodeNotApproved, "the replacement doesn't name the change this node holds (%x); approve one that does", HeldHash(held.Message))
 	}
@@ -474,9 +494,15 @@ func (m *validatorManager) Verify(ctx context.Context, msg *warp.UnsignedMessage
 	// Written (again, if it's the one held) and synced before each
 	// signature: a retry after a failed sync must not sign on a record the
 	// disk may not have. A failed write stops all signing until restart.
-	record := heldChange{Message: msg.Bytes(), Height: height}
-	if same {
+	record := heldChange{Message: msg.Bytes(), Height: height, Dropped: dropped}
+	switch {
+	case same:
 		record = *held
+		record.Dropped = dropped
+	case held != nil && replaceHeld:
+		// Replaced: remembered, so it's never signed again while it could
+		// still land.
+		record.Dropped = stillDropped(append(dropped, held.Message), current, now)
 	}
 	if err := m.lock.write(record); err != nil {
 		m.broken.Store(true)
@@ -496,7 +522,7 @@ func names(list [][32]byte, h [32]byte) bool {
 
 // Past a registration's expiry, the P-Chain (whose clock can trail this
 // node's) can't take it: wait this much longer to be sure.
-const expirySlack = 10 * time.Minute
+const expirySlack = time.Hour
 
 // checkHeld refuses a new change while the one held may still reach the
 // P-Chain. It's released only on evidence from a view at least as new as
@@ -508,27 +534,56 @@ func checkHeld(held *heldChange, change message.Payload, current map[ids.ID]*val
 	if appErr != nil {
 		return appError(errCodeNotApproved, "the change this node holds can't be read (%s); only every admin together can replace it", appErr.Message)
 	}
+	if settled(prev, current, now) {
+		return nil
+	}
 	var what string
 	switch p := prev.(type) {
 	case *message.RegisterL1Validator:
-		if _, registered := current[p.ValidationID()]; registered {
-			return nil
-		}
-		if uint64(now.Unix()) > p.Expiry+uint64(expirySlack/time.Second) {
-			return nil
-		}
 		what = fmt.Sprintf("registration %s, until it's registered or expires at %s", p.ValidationID(), time.Unix(int64(min(p.Expiry, math.MaxInt64)), 0).UTC().Format(time.RFC3339))
 	case *message.L1ValidatorWeight:
-		v, ok := current[p.ValidationID]
-		if !ok || v.MinNonce > p.Nonce {
-			return nil
-		}
 		if w, same := change.(*message.L1ValidatorWeight); same && w.ValidationID == p.ValidationID && w.Nonce == p.Nonce {
 			return nil // replaces it: the P-Chain takes only one change per nonce
 		}
 		what = fmt.Sprintf("weight %d for validation %s at nonce %d, until the P-Chain has it", p.Weight, p.ValidationID, p.Nonce)
 	}
 	return appError(errCodeNotApproved, "this node signed another validator change that isn't on the P-Chain yet (%s): submit that one first, or replace a weight change at the same nonce", what)
+}
+
+// settled: the change is on the P-Chain, or can no longer be: a
+// registration registered or past its expiry, a weight change whose nonce
+// the P-Chain passed or whose validation is gone.
+func settled(change message.Payload, current map[ids.ID]*validators.GetCurrentValidatorOutput, now time.Time) bool {
+	switch p := change.(type) {
+	case *message.RegisterL1Validator:
+		_, registered := current[p.ValidationID()]
+		return registered || uint64(now.Unix()) > p.Expiry+uint64(expirySlack/time.Second)
+	case *message.L1ValidatorWeight:
+		v, ok := current[p.ValidationID]
+		return !ok || v.MinNonce > p.Nonce
+	}
+	return false
+}
+
+// maxDropped bounds the replaced changes a node remembers.
+const maxDropped = 32
+
+// stillDropped is the replaced changes not yet settled: signed once, then
+// replaced by every admin, they're never signed again while they could
+// still reach the P-Chain.
+func stillDropped(dropped [][]byte, current map[ids.ID]*validators.GetCurrentValidatorOutput, now time.Time) [][]byte {
+	var keep [][]byte
+	for _, d := range dropped {
+		c, appErr := parseChange(d)
+		if appErr == nil && settled(c, current, now) {
+			continue
+		}
+		keep = append(keep, d)
+	}
+	if len(keep) > maxDropped {
+		keep = keep[len(keep)-maxDropped:]
+	}
+	return keep
 }
 
 // parseChange is the validator change in an unsigned Warp message from this
@@ -635,6 +690,10 @@ func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*val
 			signable.Add(signable, w)
 			active++
 		}
+		// What each key signs for: only an active validation's weight.
+		if !s.active {
+			continue
+		}
 		k := s.key
 		if k == "" {
 			k = "validation:" + id.String()
@@ -664,12 +723,14 @@ func (p adminPolicy) checkChange(change message.Payload, current map[ids.ID]*val
 		}
 		return appError(errCodeNotApproved, "%s", msg)
 	}
-	// One key that could block the quorum alone: the rest wouldn't make 67%.
+	// One key that could block the quorum alone: without the weight it signs
+	// for (offline, out of balance, disabled), the rest able to sign wouldn't
+	// make 67% of the whole.
 	for _, w := range byKey {
-		if blocks(w, total) && !all {
+		if !quorumOf(new(big.Int).Sub(signable, w), total) && !all {
 			return appError(errCodeNotApproved,
-				"after this change one validator holds %s of the L1's weight, enough to block the P-Chain's 67%% alone; that needs all %d admins, and %d approved",
-				percent(w, total), p.admins.Len(), approvals)
+				"after this change one validator signs for %s of the L1's weight, and without it the rest able to sign (%s) wouldn't make the P-Chain's 67%%; that needs all %d admins, and %d approved",
+				percent(w, total), percent(new(big.Int).Sub(signable, w), total), p.admins.Len(), approvals)
 		}
 	}
 	return nil
@@ -731,6 +792,8 @@ func (p adminPolicy) approvers(unsignedMessage, justification []byte, now time.T
 		return nil, approval, fmt.Errorf("the approvals' deadline %s is more than %s away", at.UTC().Format(time.RFC3339), MaxApprovalLife)
 	case uint64(now.Unix()) > deadline:
 		return nil, approval, fmt.Errorf("the approvals expired at %s", at.UTC().Format(time.RFC3339))
+	case approval.Flags&FlagReplaceHeld != 0 && deadline > uint64(now.Add(MaxReplaceLife).Unix()):
+		return nil, approval, fmt.Errorf("a replacement's deadline can be at most %s away", MaxReplaceLife)
 	}
 	if len(sigs) > p.admins.Len() {
 		return nil, approval, fmt.Errorf("%d approvals, but this L1 has only %d admins", len(sigs), p.admins.Len())
@@ -766,6 +829,20 @@ func (m *validatorManager) Aggregate(parent context.Context, unsignedBytes, just
 		return nil, nil, nil, nil, fmt.Errorf("not a Warp message: %w", err)
 	}
 	snowCtx := m.vm.ctx
+	// A raise must show the validator being raised signs, whatever the
+	// client asked for: otherwise more of the weight could come to depend on
+	// a validator that isn't online and signing.
+	if change, appErr := parseChange(unsignedBytes); appErr == nil {
+		if w, ok := change.(*message.L1ValidatorWeight); ok {
+			current, _, err := snowCtx.ValidatorState.GetCurrentValidatorSet(ctx, snowCtx.SubnetID)
+			if err != nil {
+				return nil, nil, nil, nil, fmt.Errorf("reading the L1's validators: %w", err)
+			}
+			if v, ok := current[w.ValidationID]; ok && w.Weight > v.Weight {
+				required = v.NodeID
+			}
+		}
+	}
 	// The P-Chain checks the signatures against the L1's validators at the
 	// P-Chain height its block proposer picks, which lags the tip (the
 	// minimum height, as proposervm uses). Signing for the same height means

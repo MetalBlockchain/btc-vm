@@ -119,6 +119,16 @@ func (f *managerFixture) fresh(t *testing.T) {
 	}
 }
 
+// anyOtherThan is an active validation other than id.
+func (f *managerFixture) anyOtherThan(id ids.ID) ids.ID {
+	for other, v := range f.current {
+		if other != id && v.IsActive {
+			return other
+		}
+	}
+	return ids.Empty
+}
+
 // anyValidation is one of the fixture L1's active validation IDs.
 func (f *managerFixture) anyValidation() ids.ID {
 	for id, v := range f.current {
@@ -217,7 +227,9 @@ func (f *managerFixture) check(t *testing.T, msg *warp.UnsignedMessage, justific
 }
 
 func TestValidatorManagerVerify(t *testing.T) {
-	f := newManagerFixture(t, true, 5)
+	// Six validators: adding a seventh at 100 leaves 500 of 700 able to sign
+	// without any one of them, so two admins suffice.
+	f := newManagerFixture(t, true, 6)
 	a, b, c := f.admins[0], f.admins[1], f.admins[2]
 	reg := f.registration(t, f.subnetID, 100)
 	good := f.unsigned(t, f.chainID, nil, reg)
@@ -279,7 +291,7 @@ func TestValidatorManagerVerify(t *testing.T) {
 	}{
 		{"registration approved by two admins", good, by(a, b), ""},
 		{"approved by all three", good, by(c, a, b), ""},
-		{"removal of one of five by two", f.unsigned(t, f.chainID, nil, f.weight(t, target, 0)), by(b, c), ""},
+		{"removal of one of six by two", f.unsigned(t, f.chainID, nil, f.weight(t, target, 0)), by(b, c), ""},
 		{"no approval", good, func(*warp.UnsignedMessage) []byte { return nil }, "no admin approvals"},
 		{"a header and no approvals", good, func(*warp.UnsignedMessage) []byte { return EncodeJustification(Approval{Deadline: f.deadline}, nil) }, "no whole admin approvals"},
 		{"one admin alone", good, by(a), "approved by 1 of this L1's admins; it needs 2"},
@@ -358,7 +370,11 @@ func TestValidatorManagerWeightShares(t *testing.T) {
 		{"second validator at 100 (only 100 of 200 could sign)", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "at most 49", "at most 49"},
 		{"second validator at 49 (the first still blocks alone)", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 49) }, "needs all 3 admins", ""},
 		{"second validator at 50", 1, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 50) }, "at most 49", "at most 49"},
-		{"fourth validator (300 of 400 can sign, 25% each)", 3, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "", ""},
+		// 300 of 400 can sign, but the newcomer can't yet: without any one of
+		// the three, 200 of 400 is under 67%.
+		{"fourth validator at 100 (a newcomer can't sign yet)", 3, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "needs all 3 admins", ""},
+		{"a sixth at 100 (without one of five, 400 of 600 isn't 67%)", 5, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "needs all 3 admins", ""},
+		{"a seventh at 100 (without one of six, 500 of 700 is)", 6, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 100) }, "", ""},
 		{"a heavy fifth (weight 400 of 800)", 4, func(f *managerFixture) message.Payload { return f.registration(t, f.subnetID, 400) }, "able to sign hold 50.0%", "able to sign hold 50.0%"},
 		// The P-Chain's quorum, exactly: 400 of 597 is 67.0%, of 598 isn't.
 		{"raising one of five to 197 (the rest still make 67%)", 5, func(f *managerFixture) message.Payload { return f.weight(t, f.anyValidation(), 197) }, "", ""},
@@ -404,20 +420,38 @@ func TestValidatorManagerInactiveWeight(t *testing.T) {
 			f.addValidator(t, 100, false)
 			return f.registration(t, f.subnetID, 100)
 		}, all, "able to sign hold 66.7%"},
-		{"...at a weight the active ones outweigh", func(f *managerFixture) message.Payload {
+		// 400 of 597 can sign, but without any one active validator 300 can't.
+		{"...at a weight the active ones outweigh: every admin", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
-			return f.registration(t, f.subnetID, 97) // 400*100 >= 597*67
-		}, two, ""},
+			return f.registration(t, f.subnetID, 97)
+		}, two, "needs all 3 admins"},
+		{"...approved by every admin", func(f *managerFixture) message.Payload {
+			f.addValidator(t, 100, false)
+			return f.registration(t, f.subnetID, 97)
+		}, all, ""},
 		{"raising an inactive validator's weight", func(f *managerFixture) message.Payload {
 			return f.weight(t, f.addValidator(t, 100, false), 300)
 		}, all, "able to sign hold"},
+		// 400 of 600 -> 400 of 500: signable again, but one loss (300 of 500)
+		// would stop it, so every admin.
 		{"removing an inactive validator from a stuck set", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
-			return f.weight(t, f.addValidator(t, 100, false), 0) // 400 of 600 -> 400 of 500
-		}, two, ""},
+			return f.weight(t, f.addValidator(t, 100, false), 0)
+		}, all, ""},
+		{"...with two admins", func(f *managerFixture) message.Payload {
+			f.addValidator(t, 100, false)
+			return f.weight(t, f.addValidator(t, 100, false), 0)
+		}, two, "needs all 3 admins"},
 		{"removing an active one while inactive weight is high", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 100, false)
-			return f.weight(t, active(f), 0) // 300 of 400
+			return f.weight(t, active(f), 0) // 300 of 400: any one more loss stops it
+		}, two, "needs all 3 admins"},
+		// The growth walk's last step: V4 joined at 1 and is active; raising it
+		// to 100 leaves 4 x 100, where losing any one still leaves 75%.
+		{"raising an active fourth validator from 1 to 100", func(f *managerFixture) message.Payload {
+			v4 := f.addValidator(t, 1, true)      // the fixture's four, plus V4 at 1
+			delete(f.current, f.anyOtherThan(v4)) // three at 100, and V4
+			return f.weight(t, v4, 100)
 		}, two, ""},
 		{"a heavy inactive validator counts (a top-up could reactivate it)", func(f *managerFixture) message.Payload {
 			f.addValidator(t, 250, false)
@@ -535,6 +569,34 @@ func TestValidatorManagerReplaceHeld(t *testing.T) {
 	d := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
 	f.check(t, d, f.approve(t, d, f.admins[0], f.admins[1]), "")
 	f.check(t, c, replaceBoth, "doesn't name the change this node holds")
+}
+
+// A change every admin replaced is never signed again while it could still
+// land; a replacement is good for an hour at most.
+func TestValidatorManagerNeverResignsAReplacedChange(t *testing.T) {
+	f := newManagerFixture(t, true, 6)
+	a := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, a, f.approve(t, a, f.admins[0], f.admins[1]), "")
+	regC := f.registration(t, f.subnetID, 100)
+	c := f.unsigned(t, f.chainID, nil, regC)
+	f.check(t, c, f.approveReplacing(t, c, [][32]byte{HeldHash(a.Bytes())}, f.admins...), "")
+	// c lands: the hold on it is settled, but a stays dropped.
+	nodeC, _ := ids.ToNodeID(regC.NodeID)
+	f.current[regC.ValidationID()] = &validators.GetCurrentValidatorOutput{ValidationID: regC.ValidationID(), NodeID: nodeC, PublicKey: blsKey(t), Weight: 100, IsActive: true, IsL1Validator: true}
+	f.height++
+	f.check(t, a, f.approve(t, a, f.admins...), "every admin replaced this change")
+	// Other changes go ahead.
+	e := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, e, f.approve(t, e, f.admins...), "")
+	held, err := f.m.lock.read()
+	if err != nil || len(held.Dropped) != 1 || !bytes.Equal(held.Dropped[0], a.Bytes()) {
+		t.Fatalf("dropped %v, %v; want a, kept across the new hold", held.Dropped, err)
+	}
+
+	// A replacement good for more than an hour is refused.
+	far := Approval{Flags: FlagReplaceHeld, Deadline: uint64(f.now.Add(2 * time.Hour).Unix()), Replaces: [][32]byte{HeldHash(e.Bytes())}}
+	g := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	f.check(t, g, EncodeJustification(far, sign(t, g, far, f.admins...)), "at most 1h0m0s away")
 }
 
 // A failed write of the held change stops all signing, and a retry of the
@@ -678,6 +740,26 @@ func TestMaxNewcomerWeight(t *testing.T) {
 		w := new(big.Int).Add(got, big.NewInt(1))
 		if quorumOf(big.NewInt(tc.signable), new(big.Int).Add(big.NewInt(tc.total), w)) {
 			t.Fatalf("%d, %d: %s more would still make 67%%", tc.signable, tc.total, w)
+		}
+	}
+}
+
+// -check-config refuses what the VM would refuse at start.
+func TestCheckChainConfig(t *testing.T) {
+	addr, err := address.Format("P", constants.GetHRP(constants.MainnetID), newKey(t).Address().Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cfg, ok := range map[string]bool{
+		`{"rpcUser":"x","validatorAdmins":["` + addr + `"]}`: true,
+		`{}`:                                true,
+		`{"validatorAdminThreshold":false}`: false,
+		`{"MAINNET":true}`:                  false,
+		`{"dropTxIndex":true}`:              false,
+		`{"validatorAdmins":["` + addr + `"],"testNet":true}`: false,
+	} {
+		if err := CheckChainConfig([]byte(cfg)); (err == nil) != ok {
+			t.Errorf("%s: %v; want ok=%v", cfg, err, ok)
 		}
 	}
 }

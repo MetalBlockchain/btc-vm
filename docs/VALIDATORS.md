@@ -11,29 +11,33 @@ recovering when something goes wrong.
 - **M of N admins.** `validatorAdmins` (P-Chain addresses) and
   `validatorAdminThreshold` (default: a majority) in every validator's chain
   config. Three admins, two of whom must approve.
-- **Every admin, while one validator could block.** A change after which any
-  one validator (one BLS key) holds enough weight to stop the P-Chain's 67%
-  quorum on its own needs every admin. With equal weights that is any set of
-  three validators or fewer.
+- **Every admin, while one validator could block.** A change after which
+  losing any one validator (one BLS key: offline, out of balance or
+  disabled) would leave the rest able to sign under 67% of the whole weight
+  needs every admin. With equal weights that is any set of three validators
+  or fewer, and any change that adds a newcomer to one of up to five (it
+  can't sign yet).
 - **What can sign must still make 67%.** Only active (funded) validators
   sign, but every registered weight counts in the total. A change that would
   leave the validators able to sign now under 67% of the total is refused,
   whoever approves it. A newcomer can't sign until it's funded and online, so
   it joins at a small weight and is raised later.
-- **A raise needs the raised validator's signature.** `set-weight` to a
-  higher weight is collected only with the raised validator's own signature
-  among the signers: proof it's online and signing.
+- **A raise needs the raised validator's signature.** A weight change that
+  raises a validator is collected only with that validator's own signature
+  among the signers (the collecting node insists, whatever the client asks):
+  proof it's online and signing.
 - **One change at a time.** Each validator holds the last change it signed
   (`held-change.json`, below) and signs no other until that one is on the
   P-Chain or can't be: a registration until it's registered or expires (a day
   at most), a weight change until the P-Chain's nonce passes it.
-- **Approvals expire.** Each approval carries a deadline: at most 7 days, a
-  registration's expiry, or an hour for a replacement.
+- **Approvals expire.** Each approval carries a deadline, at most 7 days
+  ahead (an hour for a replacement). The tool sets a registration's to its
+  expiry (at most a day).
 
 ## Growing from one validator to four
 
 Start: one validator at weight 100. Each step waits for the P-Chain to
-settle (a minute or two) before the next. The first four steps need all
+settle (a minute or two) before the next. The first five steps need all
 three admins; the last needs two.
 
 1. **Register V2 at weight 1.** `approve -request request.json -weight 1`,
@@ -41,16 +45,21 @@ three admins; the last needs two.
    at least 1 METAL.
 2. **Check V2 is active and caught up** (`btcvm-l1 validators`; the operator's
    `setup.sh --status`), then **raise it to 100**: `set-weight -validation-id
-   V2 -weight 100`, approved by all three. The submit fails unless V2 itself
-   signs.
+   V2 -weight 100`, approved by all three. The validators sign it only with
+   V2's own signature among them.
 3. **Register V3 at weight 1** (all three).
 4. **Raise V3 to 100** once it's active (all three; V3 must sign).
-5. **Register V4 at 100** (two admins): 300 of 400 can sign, 25% each. The
-   L1 now tolerates one validator offline.
+5. **Register V4 at weight 1** (all three: until it signs, losing any one of
+   the three would leave 200 of 301).
+6. **Raise V4 to 100** once it's active (two admins: 4 x 100, and without any
+   one validator the rest hold 75%). The L1 now tolerates one validator
+   offline.
 
 An unfunded or silent newcomer at weight 1 can be removed (`remove`, all
 three admins) without freezing anything, as long as the existing
-validators stay up.
+validators stay up. Growing further: a newcomer at 100 needs every admin
+until the L1 has six validators; at weight 1, raised later, two suffice
+from four.
 
 ## Day to day
 
@@ -106,15 +115,18 @@ signing. Then the admins remove them properly.
 
 Each validator keeps its held change in
 `<dataDir>/<network>/validator-manager/held-change.json`, where `dataDir` is
-the chain config's (the btcd data directory: the network name is added to
-it). It's written with fsync before every signature. If a write fails, the
+the chain config's and the network is the btcd one (`btcvm` on mainnet): for
+example `/var/lib/metalgo/l1/btcvm/data/btcvm/validator-manager/held-change.json`
+on a node metalgo-setup installed. Without a `dataDir` in the chain config it
+sits under the btcd home instead: set one. It's written with fsync before every signature. If a write fails, the
 validator stops signing until it restarts.
 
 - **Back it up together with the node's signing identity** (the staking and
   BLS keys).
-- **Never start a validator on a restored or copied data directory** without
-  the admins confirming no change is outstanding: it may hold an older change
-  than the one it really signed last, and then sign a second.
+- **Never start a validator on a restored, copied, wiped or resynced data
+  directory** without the admins confirming no change is outstanding: it may
+  hold an older change than the one it really signed last (or none), and then
+  sign a second.
 - **Never copy a held-change.json between nodes.**
 - A corrupt file stops signing until an operator looks at it.
 
