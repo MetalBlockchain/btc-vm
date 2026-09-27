@@ -40,12 +40,15 @@ import (
 // source address, signed by at least 67% of the L1's validator weight
 // (RegisterL1ValidatorTx, SetL1ValidatorWeightTx).
 //
-// Each validator signs such a message only when one of the admins in its
-// chain config ("validatorAdmins": P-Chain addresses) approved it: proof of
-// authority. The approval is the admin key's signature over
-// ApprovalHash(message), sent as the ACP-118 justification. Signing is node
-// policy, not consensus: blocks and their validity are unchanged, and a node
-// with no admins configured signs nothing.
+// Each validator signs such a message only when enough of the admins in its
+// chain config approved it: proof of authority, M of N. The admins are
+// "validatorAdmins" (P-Chain addresses); M is "validatorAdminThreshold",
+// by default a majority of them. An approval is an admin key's signature
+// over ApprovalHash(message); the ACP-118 justification is M or more such
+// signatures, one after another, each by a different admin. So no one
+// admin key can change the validator set alone. Signing is node policy,
+// not consensus: blocks and their validity are unchanged, and a node with
+// no admins configured signs nothing.
 
 // ApprovalDomain prefixes what an admin signs, so an approval can never be
 // mistaken for any other signature made with the same key (a P-Chain
@@ -65,32 +68,61 @@ func ApprovalHash(unsignedMessage []byte) []byte {
 
 // validatorAdminsConfig is the part of the chain config the manager reads.
 type validatorAdminsConfig struct {
-	ValidatorAdmins []string `json:"validatorAdmins"`
+	ValidatorAdmins         []string `json:"validatorAdmins"`
+	ValidatorAdminThreshold *int     `json:"validatorAdminThreshold"`
 }
 
-// parseValidatorAdmins reads "validatorAdmins" from the chain config.
-func parseValidatorAdmins(configBytes []byte) (set.Set[ids.ShortID], error) {
-	admins := set.Set[ids.ShortID]{}
+// adminPolicy is who approves validator changes, and how many of them must.
+type adminPolicy struct {
+	admins    set.Set[ids.ShortID]
+	threshold int
+}
+
+// majority is the default threshold: more than half of n admins.
+func majority(n int) int { return n/2 + 1 }
+
+// parseValidatorAdmins reads "validatorAdmins" and "validatorAdminThreshold"
+// from the chain config. A threshold outside 1..len(admins) is an error, so
+// a typo can't leave a chain approving on fewer signatures than intended.
+func parseValidatorAdmins(configBytes []byte) (adminPolicy, error) {
+	p := adminPolicy{admins: set.Set[ids.ShortID]{}}
 	if len(configBytes) == 0 {
-		return admins, nil
+		return p, nil
 	}
 	var cfg validatorAdminsConfig
 	if err := json.Unmarshal(configBytes, &cfg); err != nil {
-		return nil, err
+		return adminPolicy{}, err
 	}
 	for _, a := range cfg.ValidatorAdmins {
 		id, err := address.ParseToID(a)
 		if err != nil {
-			return nil, fmt.Errorf("validatorAdmins: %q is not a P-Chain address: %w", a, err)
+			return adminPolicy{}, fmt.Errorf("validatorAdmins: %q is not a P-Chain address: %w", a, err)
 		}
-		admins.Add(id)
+		if p.admins.Contains(id) {
+			return adminPolicy{}, fmt.Errorf("validatorAdmins: %q is listed twice", a)
+		}
+		p.admins.Add(id)
 	}
-	return admins, nil
+	n := p.admins.Len()
+	switch {
+	case cfg.ValidatorAdminThreshold == nil:
+		p.threshold = majority(n)
+	case n == 0:
+		return adminPolicy{}, errors.New("validatorAdminThreshold is set but validatorAdmins is empty")
+	case *cfg.ValidatorAdminThreshold < 1 || *cfg.ValidatorAdminThreshold > n:
+		return adminPolicy{}, fmt.Errorf("validatorAdminThreshold %d must be between 1 and the %d validatorAdmins", *cfg.ValidatorAdminThreshold, n)
+	default:
+		p.threshold = *cfg.ValidatorAdminThreshold
+	}
+	if n == 0 {
+		p.threshold = 0
+	}
+	return p, nil
 }
 
 type validatorManager struct {
 	vm     *VM
-	admins set.Set[ids.ShortID]
+	policy adminPolicy
 	client *p2p.Client
 }
 
@@ -108,7 +140,7 @@ func appError(code int32, format string, args ...any) *common.AppError {
 // Verify decides whether this node signs an unsigned Warp message: a
 // validator registration for this L1, or a validator weight change (weight
 // 0 removes a validator), from this chain as the L1's manager, approved by
-// an admin.
+// at least the threshold of admins.
 func (m *validatorManager) Verify(_ context.Context, msg *warp.UnsignedMessage, justification []byte) *common.AppError {
 	ctx := m.vm.ctx
 	if msg.NetworkID != ctx.NetworkID || msg.SourceChainID != ctx.ChainID {
@@ -141,20 +173,49 @@ func (m *validatorManager) Verify(_ context.Context, msg *warp.UnsignedMessage, 
 	default:
 		return appError(errCodeNotManaged, "this chain signs validator registrations and weight changes only, not %T", parsed)
 	}
-	if m.admins.Len() == 0 {
+	if m.policy.admins.Len() == 0 {
 		return appError(errCodeNotApproved, "this node has no validatorAdmins in its chain config, so it approves no validator changes")
 	}
-	if len(justification) != secp256k1.SignatureLen {
-		return appError(errCodeNotApproved, "the change carries no admin approval")
-	}
-	pub, err := secp256k1.RecoverPublicKeyFromHash(ApprovalHash(msg.Bytes()), justification)
+	approvers, err := m.policy.approvers(msg.Bytes(), justification)
 	if err != nil {
-		return appError(errCodeNotApproved, "bad admin approval: %s", err)
+		return appError(errCodeNotApproved, "%s", err)
 	}
-	if !m.admins.Contains(pub.Address()) {
-		return appError(errCodeNotApproved, "approved by %s, which is not one of this L1's validatorAdmins", pub.Address())
+	if approvers.Len() < m.policy.threshold {
+		return appError(errCodeNotApproved, "approved by %d of this L1's admins; it needs %d", approvers.Len(), m.policy.threshold)
 	}
 	return nil
+}
+
+// approvers checks every approval in a justification and returns the admins
+// who gave them. An approval from a key that isn't an admin, a second one
+// from the same admin, or a justification that isn't whole approvals
+// refuses the lot: a well-formed request never has them.
+func (p adminPolicy) approvers(unsignedMessage, justification []byte) (set.Set[ids.ShortID], error) {
+	n := len(justification) / secp256k1.SignatureLen
+	if n == 0 || len(justification)%secp256k1.SignatureLen != 0 {
+		return nil, errors.New("the change carries no admin approvals (each is a 65-byte signature)")
+	}
+	if n > p.admins.Len() {
+		return nil, fmt.Errorf("%d approvals, but this L1 has only %d admins", n, p.admins.Len())
+	}
+	hash := ApprovalHash(unsignedMessage)
+	approvers := set.NewSet[ids.ShortID](n)
+	for i := range n {
+		sig := justification[i*secp256k1.SignatureLen : (i+1)*secp256k1.SignatureLen]
+		pub, err := secp256k1.RecoverPublicKeyFromHash(hash, sig)
+		if err != nil {
+			return nil, fmt.Errorf("approval %d: %w", i+1, err)
+		}
+		who := pub.Address()
+		if !p.admins.Contains(who) {
+			return nil, fmt.Errorf("approval %d is by %s, which is not one of this L1's validatorAdmins", i+1, who)
+		}
+		if approvers.Contains(who) {
+			return nil, fmt.Errorf("approval %d repeats admin %s", i+1, who)
+		}
+		approvers.Add(who)
+	}
+	return approvers, nil
 }
 
 // Aggregate signs an approved change with this node's key, collects the
@@ -365,8 +426,8 @@ func containsNode(nodeIDs []ids.NodeID, want ids.NodeID) bool {
 
 // newValidatorManager registers the ACP-118 signature handler on the VM's
 // p2p network and a client for collecting signatures.
-func newValidatorManager(vm *VM, network *p2p.Network, admins set.Set[ids.ShortID]) (*validatorManager, error) {
-	m := &validatorManager{vm: vm, admins: admins}
+func newValidatorManager(vm *VM, network *p2p.Network, policy adminPolicy) (*validatorManager, error) {
+	m := &validatorManager{vm: vm, policy: policy}
 	if err := network.AddHandler(acp118.HandlerID, acp118.NewHandler(m, vm.ctx.WarpSigner)); err != nil {
 		return nil, fmt.Errorf("registering the signature handler: %w", err)
 	}
@@ -378,7 +439,7 @@ func newValidatorManager(vm *VM, network *p2p.Network, admins set.Set[ids.ShortI
 
 type aggregateRequest struct {
 	Message       string `json:"message"`       // hex unsigned Warp message
-	Justification string `json:"justification"` // hex admin approval
+	Justification string `json:"justification"` // hex admin approvals, one after another
 }
 
 type aggregateReply struct {

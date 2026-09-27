@@ -1,0 +1,108 @@
+// Copyright (C) 2024-2025, Metallicus, Inc. All rights reserved.
+// See the file LICENSE for licensing terms.
+
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/metalgo/utils/constants"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
+	"github.com/MetalBlockchain/metalgo/vms/platformvm/warp/message"
+)
+
+func writeKey(t *testing.T, dir, name string) string {
+	t.Helper()
+	key, err := secp256k1.NewPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(keyFile{PrivateKey: key.String()})
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeProposal(t *testing.T, dir string, p *proposal) string {
+	t.Helper()
+	raw, _ := json.Marshal(p)
+	path := filepath.Join(dir, "proposal.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestProposalApprovals(t *testing.T) {
+	dir := t.TempDir()
+	netID, chainID, subnetID := constants.LocalID, ids.GenerateTestID(), ids.GenerateTestID()
+	owner := message.PChainOwner{Threshold: 1, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}
+	nodeID := ids.GenerateTestNodeID()
+	reg, err := message.NewRegisterL1Validator(subnetID, nodeID, [bls.PublicKeyLen]byte{1}, uint64(time.Now().Add(time.Hour).Unix()), owner, owner, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned, err := unsignedFor(netID, chainID, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &change{unsigned: unsigned, reg: reg}
+	p := &proposal{UnsignedMessage: hexBytes(unsigned.Bytes())}
+	if err := c.label(p); err != nil {
+		t.Fatal(err)
+	}
+	admin1, admin2 := writeKey(t, dir, "a1.json"), writeKey(t, dir, "a2.json")
+	if err := p.addApproval(unsigned, netID, admin1); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.addApproval(unsigned, netID, admin1); err == nil || !strings.Contains(err.Error(), "already approved") {
+		t.Fatalf("a second approval by the same admin: %v", err)
+	}
+
+	// The next admin reads the file; its labels don't count, only the message.
+	p.NodeID, p.Weight, p.Summary = ids.GenerateTestNodeID().String(), 1_000_000, "something harmless"
+	read, rc, err := readProposal(writeProposal(t, dir, p), netID, chainID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.NodeID != nodeID.String() || read.Weight != 100 || !strings.Contains(read.Summary, nodeID.String()) {
+		t.Fatalf("labels not recomputed from the message: %+v", read)
+	}
+	if err := read.addApproval(rc.unsigned, netID, admin2); err != nil {
+		t.Fatal(err)
+	}
+	sigs, who, err := read.approvals(rc.unsigned)
+	if err != nil || len(sigs) != 2 || len(who) != 2 || who[0] == who[1] || len(read.ApprovedBy) != 2 {
+		t.Fatalf("approvals %d by %v (%v), %v", len(sigs), who, read.ApprovedBy, err)
+	}
+
+	// Another chain's tool refuses the file.
+	if _, _, err := readProposal(writeProposal(t, dir, read), netID, ids.GenerateTestID()); err == nil {
+		t.Fatal("read a proposal for another chain")
+	}
+	// A corrupted approval is refused.
+	read.Approvals[1] = read.Approvals[1][:len(read.Approvals[1])-2] + "zz"
+	if _, _, err := readProposal(writeProposal(t, dir, read), netID, chainID); err == nil {
+		t.Fatal("read a proposal with a corrupted approval")
+	}
+}
+
+func TestExpiredRegistrationRefused(t *testing.T) {
+	owner := message.PChainOwner{Threshold: 1, Addresses: []ids.ShortID{ids.GenerateTestShortID()}}
+	reg, err := message.NewRegisterL1Validator(ids.GenerateTestID(), ids.GenerateTestNodeID(), [bls.PublicKeyLen]byte{1}, uint64(time.Now().Add(-time.Minute).Unix()), owner, owner, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&change{reg: reg}).check(); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired registration: %v", err)
+	}
+}

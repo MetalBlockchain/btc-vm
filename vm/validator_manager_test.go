@@ -24,30 +24,37 @@ import (
 
 type managerFixture struct {
 	m        *validatorManager
-	admin    *secp256k1.PrivateKey
+	admins   []*secp256k1.PrivateKey // three admins, any two approve
 	outsider *secp256k1.PrivateKey
 	netID    uint32
 	chainID  ids.ID
 	subnetID ids.ID
 }
 
-func newManagerFixture(t *testing.T, withAdmin bool) *managerFixture {
+func newKey(t *testing.T) *secp256k1.PrivateKey {
 	t.Helper()
-	admin, err := secp256k1.NewPrivateKey()
+	k, err := secp256k1.NewPrivateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	outsider, err := secp256k1.NewPrivateKey()
-	if err != nil {
-		t.Fatal(err)
+	return k
+}
+
+func newManagerFixture(t *testing.T, withAdmins bool) *managerFixture {
+	t.Helper()
+	f := &managerFixture{outsider: newKey(t), netID: constants.LocalID, chainID: ids.GenerateTestID(), subnetID: ids.GenerateTestID()}
+	policy := adminPolicy{admins: set.Set[ids.ShortID]{}}
+	for range 3 {
+		f.admins = append(f.admins, newKey(t))
 	}
-	f := &managerFixture{admin: admin, outsider: outsider, netID: constants.LocalID, chainID: ids.GenerateTestID(), subnetID: ids.GenerateTestID()}
-	admins := set.Set[ids.ShortID]{}
-	if withAdmin {
-		admins.Add(admin.Address())
+	if withAdmins {
+		for _, a := range f.admins {
+			policy.admins.Add(a.Address())
+		}
+		policy.threshold = 2
 	}
 	vm := &VM{ctx: &snow.Context{NetworkID: f.netID, ChainID: f.chainID, SubnetID: f.subnetID}}
-	f.m = &validatorManager{vm: vm, admins: admins}
+	f.m = &validatorManager{vm: vm, policy: policy}
 	return f
 }
 
@@ -75,17 +82,23 @@ func (f *managerFixture) registration(t *testing.T, subnetID ids.ID, weight uint
 	return r
 }
 
-func approve(t *testing.T, key *secp256k1.PrivateKey, msg *warp.UnsignedMessage) []byte {
+// approve is the justification carrying each key's approval of msg, in order.
+func approve(t *testing.T, msg *warp.UnsignedMessage, keys ...*secp256k1.PrivateKey) []byte {
 	t.Helper()
-	sig, err := key.SignHash(ApprovalHash(msg.Bytes()))
-	if err != nil {
-		t.Fatal(err)
+	var out []byte
+	for _, key := range keys {
+		sig, err := key.SignHash(ApprovalHash(msg.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, sig...)
 	}
-	return sig
+	return out
 }
 
 func TestValidatorManagerVerify(t *testing.T) {
 	f := newManagerFixture(t, true)
+	a, b, c := f.admins[0], f.admins[1], f.admins[2]
 	weight, err := message.NewL1ValidatorWeight(ids.GenerateTestID(), 3, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -94,13 +107,17 @@ func TestValidatorManagerVerify(t *testing.T) {
 	good := f.unsigned(t, f.chainID, nil, reg)
 
 	rawHash := sha256.Sum256(good.Bytes())
-	undomained, err := f.admin.SignHash(rawHash[:])
+	undomained, err := a.SignHash(rawHash[:])
 	if err != nil {
 		t.Fatal(err)
 	}
 	conversion, err := message.NewSubnetToL1Conversion(ids.GenerateTestID())
 	if err != nil {
 		t.Fatal(err)
+	}
+	other := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
+	by := func(keys ...*secp256k1.PrivateKey) func(*warp.UnsignedMessage) []byte {
+		return func(m *warp.UnsignedMessage) []byte { return approve(t, m, keys...) }
 	}
 
 	for _, tc := range []struct {
@@ -109,19 +126,26 @@ func TestValidatorManagerVerify(t *testing.T) {
 		justification func(*warp.UnsignedMessage) []byte
 		wantErr       string // "" = must sign
 	}{
-		{"admin-approved registration", good, func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, ""},
-		{"admin-approved removal (weight 0)", f.unsigned(t, f.chainID, nil, weight), func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, ""},
-		{"no approval", good, func(*warp.UnsignedMessage) []byte { return nil }, "no admin approval"},
-		{"approved by a key that isn't an admin", good, func(m *warp.UnsignedMessage) []byte { return approve(t, f.outsider, m) }, "not one of this L1's validatorAdmins"},
-		{"admin signed the bare hash, not the approval", good, func(*warp.UnsignedMessage) []byte { return undomained }, "not one of this L1's validatorAdmins"},
-		{"approval of a different message", good, func(*warp.UnsignedMessage) []byte {
-			return approve(t, f.admin, f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100)))
+		{"registration approved by two admins", good, by(a, b), ""},
+		{"approved by all three", good, by(c, a, b), ""},
+		{"removal (weight 0) approved by two", f.unsigned(t, f.chainID, nil, weight), by(b, c), ""},
+		{"no approval", good, func(*warp.UnsignedMessage) []byte { return nil }, "no admin approvals"},
+		{"one admin alone", good, by(a), "approved by 1 of this L1's admins; it needs 2"},
+		{"one admin twice", good, by(a, a), "repeats admin"},
+		{"an admin and an outsider", good, by(a, f.outsider), "not one of this L1's validatorAdmins"},
+		{"more approvals than admins", good, by(a, b, c, a), "only 3 admins"},
+		{"a partial approval", good, func(m *warp.UnsignedMessage) []byte { return approve(t, m, a, b)[:100] }, "each is a 65-byte signature"},
+		{"admin signed the bare hash, not the approval", good, func(m *warp.UnsignedMessage) []byte {
+			return append(approve(t, m, b), undomained...)
 		}, "not one of this L1's validatorAdmins"},
-		{"another L1's subnet", f.unsigned(t, f.chainID, nil, f.registration(t, ids.GenerateTestID(), 100)), func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, "registration is for subnet"},
-		{"weight 0 registration", f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 0)), func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, "weight above 0"},
-		{"non-empty source address", f.unsigned(t, f.chainID, []byte{1, 2, 3}, reg), func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, "source address must be empty"},
-		{"from another chain", f.unsigned(t, ids.GenerateTestID(), nil, reg), func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, "not this chain"},
-		{"another kind of message", f.unsigned(t, f.chainID, nil, conversion), func(m *warp.UnsignedMessage) []byte { return approve(t, f.admin, m) }, "registrations and weight changes only"},
+		{"second approval is of a different message", good, func(m *warp.UnsignedMessage) []byte {
+			return append(approve(t, m, a), approve(t, other, b)...)
+		}, "not one of this L1's validatorAdmins"},
+		{"another L1's subnet", f.unsigned(t, f.chainID, nil, f.registration(t, ids.GenerateTestID(), 100)), by(a, b), "registration is for subnet"},
+		{"weight 0 registration", f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 0)), by(a, b), "weight above 0"},
+		{"non-empty source address", f.unsigned(t, f.chainID, []byte{1, 2, 3}, reg), by(a, b), "source address must be empty"},
+		{"from another chain", f.unsigned(t, ids.GenerateTestID(), nil, reg), by(a, b), "not this chain"},
+		{"another kind of message", f.unsigned(t, f.chainID, nil, conversion), by(a, b), "registrations and weight changes only"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			appErr := f.m.Verify(context.Background(), tc.msg, tc.justification(tc.msg))
@@ -140,33 +164,62 @@ func TestValidatorManagerVerify(t *testing.T) {
 func TestValidatorManagerWithoutAdminsSignsNothing(t *testing.T) {
 	f := newManagerFixture(t, false)
 	msg := f.unsigned(t, f.chainID, nil, f.registration(t, f.subnetID, 100))
-	appErr := f.m.Verify(context.Background(), msg, approve(t, f.admin, msg))
+	appErr := f.m.Verify(context.Background(), msg, approve(t, msg, f.admins...))
 	if appErr == nil || !strings.Contains(appErr.Message, "no validatorAdmins") {
 		t.Fatalf("got %v; want a refusal for no validatorAdmins", appErr)
 	}
 }
 
 func TestParseValidatorAdmins(t *testing.T) {
-	key, err := secp256k1.NewPrivateKey()
-	if err != nil {
-		t.Fatal(err)
+	var addrs []string
+	for range 3 {
+		addr, err := address.Format("P", constants.GetHRP(constants.MainnetID), newKey(t).Address().Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs = append(addrs, `"`+addr+`"`)
 	}
-	addr, err := address.Format("P", constants.GetHRP(constants.MainnetID), key.Address().Bytes())
-	if err != nil {
-		t.Fatal(err)
+	config := func(admins []string, threshold string) []byte {
+		s := `{"rpcUser":"x","validatorAdmins":[` + strings.Join(admins, ",") + `]`
+		if threshold != "" {
+			s += `,"validatorAdminThreshold":` + threshold
+		}
+		return []byte(s + "}")
 	}
-	admins, err := parseValidatorAdmins([]byte(`{"rpcUser":"x","validatorAdmins":["` + addr + `"]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !admins.Contains(key.Address()) || admins.Len() != 1 {
-		t.Fatalf("admins %v; want %s", admins, addr)
-	}
-	if a, err := parseValidatorAdmins(nil); err != nil || a.Len() != 0 {
-		t.Fatalf("empty config: %v, %v", a, err)
-	}
-	if _, err := parseValidatorAdmins([]byte(`{"validatorAdmins":["not-an-address"]}`)); err == nil {
-		t.Fatal("accepted a bad address")
+	for _, tc := range []struct {
+		name      string
+		config    []byte
+		admins    int
+		threshold int // -1 = must be refused
+	}{
+		{"no config", nil, 0, 0},
+		{"no admins", []byte(`{"rpcUser":"x"}`), 0, 0},
+		{"one admin, default threshold", config(addrs[:1], ""), 1, 1},
+		{"two admins, default is both", config(addrs[:2], ""), 2, 2},
+		{"three admins, default is two", config(addrs, ""), 3, 2},
+		{"three admins, all three", config(addrs, "3"), 3, 3},
+		{"three admins, one (explicit)", config(addrs, "1"), 3, 1},
+		{"threshold above the admins", config(addrs, "4"), 0, -1},
+		{"threshold 0", config(addrs, "0"), 0, -1},
+		{"threshold without admins", config(nil, "1"), 0, -1},
+		{"an admin twice", config([]string{addrs[0], addrs[0]}, ""), 0, -1},
+		{"a bad address", config([]string{`"not-an-address"`}, ""), 0, -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := parseValidatorAdmins(tc.config)
+			if tc.threshold < 0 {
+				if err == nil {
+					t.Fatalf("accepted: %d admins, threshold %d", p.admins.Len(), p.threshold)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.admins.Len() != tc.admins || p.threshold != tc.threshold {
+				t.Fatalf("%d admins, threshold %d; want %d, %d", p.admins.Len(), p.threshold, tc.admins, tc.threshold)
+			}
+		})
 	}
 }
 

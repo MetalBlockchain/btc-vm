@@ -8,13 +8,16 @@
 #    (METALGO_SRC/staking/local), sybil protection on.
 # 2. Creates a BTCVM L1 validated by node 1 alone (btcvm-l1 create), every
 #    node tracking it, each with its own miningAddrs and the same
-#    validatorAdmins (one admin key made here).
-# 3. Adds node 2, then node 3: request -> approve (admin, via node 1) ->
-#    register (paid by the local network's public ewoq key).
+#    validatorAdmins: three admin keys made here, any two of which approve
+#    (validatorAdminThreshold 2).
+# 3. Adds node 2, then node 3: request -> approve (admin 1 starts the
+#    proposal) -> approve (admin 2, submitting via node 1) -> register (paid
+#    by the local network's public ewoq key).
 # 4. Sends payments until each of the three validators has built blocks and
 #    been paid their fees; nodes 4 and 5, not validators, build none.
-# 5. Removes node 3 and checks it builds no more blocks.
-# 6. Checks that a change without an admin's approval is refused.
+# 5. Removes node 3 (admins 2 and 3) and checks it builds no more blocks.
+# 6. Checks that a change with one admin's approval, or an outsider's, is
+#    refused.
 #
 # Development only: the keys are public. State in DEVNET_DIR (default
 # ~/.btcvm-validators-devnet), deleted at the start of each run. KEEP=1 leaves
@@ -122,8 +125,8 @@ ok "5 nodes up, P-Chain synced"
 log "BTCVM L1 validated by node 1"
 "$BIN/btcvm-devnet" -ewoq-key-out "$DIR/ewoq.json"
 EWOQ_P=$(jq -r .pChainAddress "$DIR/ewoq.json")
-"$BIN/btcvm-l1" key -out "$DIR/admin.json" -network-id $NETWORK_ID >/dev/null
-ADMIN_P=$(jq -r .pChainAddress "$DIR/admin.json")
+for a in 1 2 3; do "$BIN/btcvm-l1" key -out "$DIR/admin$a.json" -network-id $NETWORK_ID >/dev/null; done
+ADMINS=$(jq -s 'map(.pChainAddress)' "$DIR"/admin{1,2,3}.json)
 "$BIN/btcvm-l1" key -out "$DIR/outsider.json" -network-id $NETWORK_ID >/dev/null
 "$BIN/btcvm" keygen -vm-network testnet >"$DIR/reserve.json"
 for i in $(seq $N); do "$BIN/btcvm" keygen -vm-network testnet >"$DIR/builder$i.json"; done
@@ -137,9 +140,9 @@ SUBNET_ID=$(jq -r .subnetID "$DIR/chain.json")
 for i in $(seq $N); do
   mkdir -p "$DIR/n$i/chain-configs/$CHAIN_ID"
   jq -n --arg pass "$(cat "$DIR/rpc-password")" --arg builder "$(jq -r .btcvmAddress "$DIR/builder$i.json")" \
-    --arg admin "$ADMIN_P" --arg d "$DIR/n$i/chaindata" --arg l "$DIR/n$i/chainlogs" \
+    --argjson admins "$ADMINS" --arg d "$DIR/n$i/chaindata" --arg l "$DIR/n$i/chainlogs" \
     '{rpcUser: "btcvm", rpcPass: $pass, txIndex: true, addrIndex: true,
-      miningAddrs: [$builder], validatorAdmins: [$admin], dataDir: $d, logDir: $l}' \
+      miningAddrs: [$builder], validatorAdmins: $admins, validatorAdminThreshold: 2, dataDir: $d, logDir: $l}' \
     >"$DIR/n$i/chain-configs/$CHAIN_ID/config.json"
 done
 stop_all
@@ -173,8 +176,10 @@ settling() {
 }
 approve_and_register() {
   local i=$1
-  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request$i.json" \
-    -key "$DIR/admin.json" -rpc-pass-file "$DIR/rpc-password" >"$DIR/registration$i.json" || return 1
+  "$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request$i.json" -key "$DIR/admin1.json" \
+    >"$DIR/proposal$i.json" || return 1
+  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/proposal$i.json" \
+    -key "$DIR/admin2.json" -rpc-pass-file "$DIR/rpc-password" >"$DIR/registration$i.json" || return 1
   "$BIN/btcvm-l1" register -registration "$DIR/registration$i.json" -key "$DIR/ewoq.json" \
     -uri "$(uri "$i")" -balance 1 >"$DIR/registered$i.json"
 }
@@ -246,8 +251,13 @@ done
 # --- 5. Remove node 3 -------------------------------------------------------------------
 log "Remove node 3"
 N3=$(jq -r .validationID "$DIR/registration3.json")
-settling "$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N3" -key "$DIR/admin.json" \
-  -payer-key "$DIR/ewoq.json" -rpc-pass-file "$DIR/rpc-password"
+remove_node3() {
+  "$BIN/btcvm-l1" remove "${L1[@]}" -node-uri "$(uri 1)" -validation-id "$N3" -key "$DIR/admin2.json" \
+    >"$DIR/remove3.json" || return 1
+  "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/remove3.json" -key "$DIR/admin3.json" \
+    -payer-key "$DIR/ewoq.json" -rpc-pass-file "$DIR/rpc-password"
+}
+settling remove_node3
 N3_ID=$(jq -r .nodeID "$DIR/registration3.json")
 not_validator() { ! has_validator "$1"; }
 wait_for 60 "node 3 off the validator list" not_validator "$N3_ID"
@@ -265,17 +275,28 @@ done
 ok "node 3 built none of the next $(($(height) - FIRST + 1)) blocks"
 
 # --- 6. Refusals ---------------------------------------------------------------------------
-log "Changes without an admin's approval are refused"
+log "Changes without two admins' approval are refused"
 "$BIN/btcvm-l1" request -node-uri "$(uri 4)" -owner "$EWOQ_P" >"$DIR/request4.json"
 if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request4.json" \
+  -key "$DIR/admin1.json" -rpc-pass-file "$DIR/rpc-password" >"$DIR/out4.json" 2>"$DIR/err4.txt"; then
+  fail "one admin alone got a registration signed"
+fi
+grep -q "approved by 1 of this L1's admins; it needs 2" "$DIR/err4.txt" || fail "unexpected refusal: $(cat "$DIR/err4.txt")"
+ok "one admin alone refused: $(tail -1 "$DIR/err4.txt" | cut -c1-110)"
+"$BIN/btcvm-l1" approve "${L1[@]}" -request "$DIR/request4.json" -key "$DIR/admin1.json" >"$DIR/proposal4.json"
+if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/proposal4.json" \
   -key "$DIR/outsider.json" -rpc-pass-file "$DIR/rpc-password" >"$DIR/out4.json" 2>"$DIR/err4.txt"; then
-  fail "a non-admin key got a registration signed"
+  fail "an admin plus a non-admin key got a registration signed"
 fi
 grep -q "not one of this L1's validatorAdmins" "$DIR/err4.txt" || fail "unexpected refusal: $(cat "$DIR/err4.txt")"
-ok "non-admin approval refused: $(tail -1 "$DIR/err4.txt" | cut -c1-110)"
+ok "an admin plus an outsider refused: $(tail -1 "$DIR/err4.txt" | cut -c1-110)"
+if "$BIN/btcvm-l1" approve "${L1[@]}" -proposal "$DIR/proposal4.json" -key "$DIR/admin1.json" >/dev/null 2>"$DIR/err4.txt"; then
+  fail "one admin approved the same change twice"
+fi
+ok "an admin can't approve twice"
 echo wrong >"$DIR/wrong-password"
-if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -request "$DIR/request4.json" \
-  -key "$DIR/admin.json" -rpc-pass-file "$DIR/wrong-password" >/dev/null 2>"$DIR/err5.txt"; then
+if "$BIN/btcvm-l1" approve "${L1[@]}" -node-uri "$(uri 1)" -proposal "$DIR/proposal4.json" \
+  -key "$DIR/admin2.json" -rpc-pass-file "$DIR/wrong-password" >/dev/null 2>"$DIR/err5.txt"; then
   fail "the signing endpoint answered without the chain's RPC login"
 fi
 ok "signing endpoint needs the RPC login"

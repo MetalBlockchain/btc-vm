@@ -242,15 +242,15 @@ func (vm *VM) Initialize(
 	vm.p2pNetwork = p2pNet
 	vm.ctx.Log.Info("p2p network initialized successfully")
 
-	admins, err := parseValidatorAdmins(configBytes)
+	policy, err := parseValidatorAdmins(configBytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse chain config: %w", err)
 	}
-	vm.validatorManager, err = newValidatorManager(vm, p2pNet, admins)
+	vm.validatorManager, err = newValidatorManager(vm, p2pNet, policy)
 	if err != nil {
 		return err
 	}
-	vm.ctx.Log.Info("validator manager ready", zap.Int("validatorAdmins", admins.Len()))
+	vm.ctx.Log.Info("validator manager ready", zap.Int("validatorAdmins", policy.admins.Len()), zap.Int("validatorAdminThreshold", policy.threshold))
 
 	// Note: Unified gossip system will be initialized in onNormalOperationsStarted()
 	// when SetState(snow.NormalOp) is called

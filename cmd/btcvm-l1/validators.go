@@ -7,21 +7,33 @@ package main
 //
 // The L1's manager is the BTCVM chain itself (see create), so each change
 // is a Warp message from the chain that the L1's current validators sign,
-// and each validator signs only a change an admin approved (the admins are
-// "validatorAdmins" in each validator's chain config; vm/validator_manager.go).
+// and each validator signs only a change enough admins approved (M of N:
+// "validatorAdmins" and "validatorAdminThreshold" in each validator's chain
+// config; vm/validator_manager.go).
+//
+// A change travels as a proposal file: the first admin makes it, each
+// other admin adds an approval on their own machine, and anyone with a
+// validator node's rpcPass submits it once it has enough.
 //
 //	candidate:  btcvm-l1 request -node-uri http://127.0.0.1:9650 -owner P-metal1... > request.json
-//	admin:      btcvm-l1 approve -request request.json -key admin-key.json \
-//	              -node-uri http://127.0.0.1:9660 -rpc-pass-file rpc-password > registration.json
+//	admin 1:    btcvm-l1 approve -request request.json -key admin1-key.json > proposal.json
+//	admin 2:    btcvm-l1 approve -proposal proposal.json -key admin2-key.json > proposal2.json
+//	submitter:  btcvm-l1 submit -proposal proposal2.json -node-uri http://127.0.0.1:9660 \
+//	              -rpc-pass-file rpc-password > registration.json
 //	candidate:  btcvm-l1 register -registration registration.json -key my-p-chain-key.json -balance 1
-//	admin:      btcvm-l1 remove -validation-id ... -key admin-key.json -node-uri ... -rpc-pass-file ...
+//	admin 1:    btcvm-l1 remove -validation-id ... -key admin1-key.json -node-uri ... > proposal.json
+//	            (then approve -proposal and submit as above; submit -payer-key pays the P-Chain fee)
 //	anyone:     btcvm-l1 top-up -validation-id ... -key p-chain-key.json -balance 1
 //	owner:      btcvm-l1 disable -validation-id ... -key owner-key.json   (ends it; the unused balance returns to the owner)
 //	anyone:     btcvm-l1 validators -node-uri ...
 //
+// approve and remove also take -rpc-pass-file, to submit at once when this
+// approval is the last one needed.
+//
 // Nothing secret changes hands: a request holds the candidate's NodeID and
-// BLS public key and proof of possession; a registration holds the signed
-// Warp message. Each party's private key stays in its own key file.
+// BLS public key and proof of possession; a proposal holds the unsigned
+// change and the admins' approvals; a registration holds the signed Warp
+// message. Each party's private key stays in its own key file.
 
 import (
 	"bytes"
@@ -39,7 +51,9 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/api/info"
 	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/metalgo/utils/constants"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/formatting/address"
 	"github.com/MetalBlockchain/metalgo/utils/units"
 	"github.com/MetalBlockchain/metalgo/vms/platformvm"
@@ -167,22 +181,181 @@ func cmdRequest(args []string) error {
 	})
 }
 
-// approveAndCollect signs an unsigned message as the admin and has the
-// validator node at nodeURI collect the L1 validators' signatures on it.
-func approveAndCollect(nodeURI string, chainID ids.ID, adminKeyPath, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage) (*warp.Message, error) {
-	key, err := readKey(adminKeyPath)
+// proposal is a validator change on its way through the admins: the unsigned
+// Warp message and the approvals so far. Every field but the message and
+// the approvals is a label, recomputed from the message whenever it's read.
+type proposal struct {
+	Change          string   `json:"change"` // "register" or "set-weight"
+	Summary         string   `json:"summary"`
+	UnsignedMessage string   `json:"unsignedMessage"`
+	Approvals       []string `json:"approvals"`
+	ApprovedBy      []string `json:"approvedBy"`
+	// For a registration: what the candidate needs to register.
+	NodeID               string `json:"nodeID,omitempty"`
+	ValidationID         string `json:"validationID,omitempty"`
+	Weight               uint64 `json:"weight"`
+	Expiry               string `json:"expiry,omitempty"`
+	BLSProofOfPossession string `json:"blsProofOfPossession,omitempty"`
+}
+
+// change is what an unsigned message asks for.
+type change struct {
+	unsigned *warp.UnsignedMessage
+	reg      *message.RegisterL1Validator
+	weight   *message.L1ValidatorWeight
+}
+
+func parseChange(networkID uint32, chainID ids.ID, unsignedBytes []byte) (*change, error) {
+	unsigned, err := warp.ParseUnsignedMessage(unsignedBytes)
 	if err != nil {
-		return nil, fmt.Errorf("admin key: %w", err)
+		return nil, fmt.Errorf("not an unsigned Warp message: %w", err)
 	}
-	approval, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes()))
+	if unsigned.NetworkID != networkID || unsigned.SourceChainID != chainID {
+		return nil, fmt.Errorf("the change is for network %d chain %s, not network %d chain %s", unsigned.NetworkID, unsigned.SourceChainID, networkID, chainID)
+	}
+	call, err := payload.ParseAddressedCall(unsigned.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("not an addressed call: %w", err)
+	}
+	parsed, err := message.Parse(call.Payload)
 	if err != nil {
 		return nil, err
 	}
+	c := &change{unsigned: unsigned}
+	switch p := parsed.(type) {
+	case *message.RegisterL1Validator:
+		c.reg = p
+	case *message.L1ValidatorWeight:
+		c.weight = p
+	default:
+		return nil, fmt.Errorf("not a validator change: %T", parsed)
+	}
+	return c, nil
+}
+
+// label fills a proposal's labels from its change.
+func (c *change) label(p *proposal) error {
+	switch {
+	case c.reg != nil:
+		nodeID, err := ids.ToNodeID(c.reg.NodeID)
+		if err != nil {
+			return err
+		}
+		expiry := time.Unix(int64(c.reg.Expiry), 0).UTC()
+		p.Change, p.NodeID, p.ValidationID, p.Weight = "register", nodeID.String(), c.reg.ValidationID().String(), c.reg.Weight
+		p.Expiry = expiry.Format(time.RFC3339)
+		var owners []string
+		for _, a := range c.reg.RemainingBalanceOwner.Addresses {
+			addr, err := address.Format("P", constants.GetHRP(c.unsigned.NetworkID), a.Bytes())
+			if err != nil {
+				return err
+			}
+			owners = append(owners, addr)
+		}
+		p.Summary = fmt.Sprintf("register %s on subnet %s with weight %d; what's left of its balance returns to %s; valid until %s",
+			nodeID, c.reg.SubnetID, c.reg.Weight, strings.Join(owners, ", "), p.Expiry)
+	default:
+		p.Change, p.ValidationID, p.Weight = "set-weight", c.weight.ValidationID.String(), c.weight.Weight
+		p.NodeID, p.Expiry, p.BLSProofOfPossession = "", "", ""
+		verb := fmt.Sprintf("set the weight of validation %s to %d", c.weight.ValidationID, c.weight.Weight)
+		if c.weight.Weight == 0 {
+			verb = fmt.Sprintf("remove validation %s", c.weight.ValidationID)
+		}
+		p.Summary = fmt.Sprintf("%s (nonce %d)", verb, c.weight.Nonce)
+	}
+	return nil
+}
+
+// check refuses a registration that has expired: nobody could register it.
+func (c *change) check() error {
+	if c.reg != nil && time.Now().Unix() >= int64(c.reg.Expiry) {
+		return fmt.Errorf("this registration expired at %s; start a new one", time.Unix(int64(c.reg.Expiry), 0).UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// approvals decodes a proposal's approvals and who gave each.
+func (p *proposal) approvals(unsigned *warp.UnsignedMessage) ([][]byte, []ids.ShortID, error) {
+	hash := vm.ApprovalHash(unsigned.Bytes())
+	var sigs [][]byte
+	var who []ids.ShortID
+	for i, a := range p.Approvals {
+		sig, err := unhex(a, fmt.Sprintf("approval %d", i+1))
+		if err != nil {
+			return nil, nil, err
+		}
+		pub, err := secp256k1.RecoverPublicKeyFromHash(hash, sig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("approval %d doesn't verify: %w", i+1, err)
+		}
+		sigs, who = append(sigs, sig), append(who, pub.Address())
+	}
+	return sigs, who, nil
+}
+
+// addApproval signs the proposal's change with an admin key.
+func (p *proposal) addApproval(unsigned *warp.UnsignedMessage, networkID uint32, keyPath string) error {
+	key, err := readKey(keyPath)
+	if err != nil {
+		return fmt.Errorf("admin key: %w", err)
+	}
+	_, who, err := p.approvals(unsigned)
+	if err != nil {
+		return err
+	}
+	for _, w := range who {
+		if w == key.Address() {
+			return errors.New("this key has already approved this change")
+		}
+	}
+	sig, err := key.SignHash(vm.ApprovalHash(unsigned.Bytes()))
+	if err != nil {
+		return err
+	}
+	p.Approvals = append(p.Approvals, hexBytes(sig))
+	p.ApprovedBy = p.ApprovedBy[:0]
+	for _, w := range append(who, key.Address()) {
+		addr, err := address.Format("P", constants.GetHRP(networkID), w.Bytes())
+		if err != nil {
+			return err
+		}
+		p.ApprovedBy = append(p.ApprovedBy, addr)
+	}
+	return nil
+}
+
+// readProposal reads and checks a proposal: its change, for this chain, and
+// its approvals (each must verify; the validators check who gave them).
+func readProposal(path string, networkID uint32, chainID ids.ID) (*proposal, *change, error) {
+	var p proposal
+	if err := readJSON(path, &p); err != nil {
+		return nil, nil, fmt.Errorf("-proposal: %w", err)
+	}
+	raw, err := unhex(p.UnsignedMessage, "unsignedMessage")
+	if err != nil {
+		return nil, nil, err
+	}
+	c, err := parseChange(networkID, chainID, raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := c.label(&p); err != nil {
+		return nil, nil, err
+	}
+	if _, _, err := p.approvals(c.unsigned); err != nil {
+		return nil, nil, err
+	}
+	return &p, c, nil
+}
+
+// collect has the validator node at nodeURI collect the L1 validators'
+// signatures on an approved change.
+func collect(nodeURI string, chainID ids.ID, rpcUser, rpcPassFile string, unsigned *warp.UnsignedMessage, approvals [][]byte) (*warp.Message, error) {
 	pass, err := os.ReadFile(rpcPassFile)
 	if err != nil {
 		return nil, fmt.Errorf("-rpc-pass-file: %w", err)
 	}
-	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(approval)})
+	body, _ := json.Marshal(map[string]string{"message": hexBytes(unsigned.Bytes()), "justification": hexBytes(bytes.Join(approvals, nil))})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(nodeURI, "/")+"/ext/bc/"+chainID.String()+"/validators", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -210,6 +383,62 @@ func approveAndCollect(nodeURI string, chainID ids.ID, adminKeyPath, rpcUser, rp
 	return warp.ParseMessage(signed)
 }
 
+// submitFlags are how a proposal reaches the validators.
+type submitFlags struct {
+	rpcUser, rpcPassFile, payerPath *string
+}
+
+func addSubmitFlags(fs *flag.FlagSet, optional bool) submitFlags {
+	what := "file holding the validator node's BTCVM rpcPass"
+	if optional {
+		what += " (to submit now: this approval is the last one needed)"
+	}
+	return submitFlags{
+		rpcUser:     fs.String("rpc-user", "btcvm", "the validator node's BTCVM rpcUser"),
+		rpcPassFile: fs.String("rpc-pass-file", "", what),
+		payerPath:   fs.String("payer-key", "", "for a weight change: the P-Chain key that pays its fee"),
+	}
+}
+
+// submit has the validators sign an approved proposal. A registration is
+// printed for the candidate to register; a weight change is issued on the
+// P-Chain at once, paid by -payer-key.
+func submit(p *proposal, c *change, nodeURI string, chainID ids.ID, f submitFlags) error {
+	if err := c.check(); err != nil {
+		return err
+	}
+	sigs, _, err := p.approvals(c.unsigned)
+	if err != nil {
+		return err
+	}
+	if c.weight != nil && *f.payerPath == "" {
+		return errors.New("-payer-key is needed to issue a weight change")
+	}
+	signed, err := collect(nodeURI, chainID, *f.rpcUser, *f.rpcPassFile, c.unsigned, sigs)
+	if err != nil {
+		return err
+	}
+	if c.reg != nil {
+		return printJSON(registration{
+			NodeID:               p.NodeID,
+			ValidationID:         p.ValidationID,
+			Weight:               p.Weight,
+			Expiry:               p.Expiry,
+			BLSProofOfPossession: p.BLSProofOfPossession,
+			SignedMessage:        hexBytes(signed.Bytes()),
+		})
+	}
+	wallet, err := pWallet(nodeURI, *f.payerPath)
+	if err != nil {
+		return err
+	}
+	tx, err := wallet.IssueSetL1ValidatorWeightTx(signed.Bytes())
+	if err != nil {
+		return fmt.Errorf("issuing the weight change: %w", err)
+	}
+	return printJSON(map[string]string{"validationID": p.ValidationID, "txID": tx.ID().String()})
+}
+
 func unsignedFor(networkID uint32, chainID ids.ID, p message.Payload) (*warp.UnsignedMessage, error) {
 	// The L1's manager address is empty (see create).
 	call, err := payload.NewAddressedCall(nil, p.Bytes())
@@ -219,83 +448,126 @@ func unsignedFor(networkID uint32, chainID ids.ID, p message.Payload) (*warp.Uns
 	return warp.NewUnsignedMessage(networkID, chainID, call.Bytes())
 }
 
-// cmdApprove approves a candidate's request and prints the registration.
+// cmdApprove approves a change: a candidate's request (making a new
+// proposal), or a proposal another admin started (adding this approval).
 func cmdApprove(args []string) error {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
 	l1 := addL1Flags(fs)
-	requestPath := fs.String("request", "", "the candidate's request.json")
+	requestPath := fs.String("request", "", "a candidate's request.json: start a registration proposal")
+	proposalPath := fs.String("proposal", "", "a proposal another admin started: add this approval")
 	keyPath := fs.String("key", "", "an admin key (its P-Chain address is in the validators' validatorAdmins)")
-	rpcUser := fs.String("rpc-user", "btcvm", "the validator node's BTCVM rpcUser")
-	rpcPassFile := fs.String("rpc-pass-file", "", "file holding the validator node's BTCVM rpcPass")
-	weight := fs.Uint64("weight", 100, "the new validator's weight (the first validator has 100)")
-	valid := fs.Duration("valid-for", time.Hour, "how long the candidate has to register (at most 24h)")
+	weight := fs.Uint64("weight", 100, "with -request: the new validator's weight (the first validator has 100)")
+	valid := fs.Duration("valid-for", 23*time.Hour, "with -request: how long the admins and the candidate have to finish (at most 24h, which the P-Chain counts from when it is registered)")
+	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
-	if *requestPath == "" || *keyPath == "" || *rpcPassFile == "" {
-		return errors.New("-request, -key and -rpc-pass-file are required")
-	}
-	if *valid <= 0 || *valid > 24*time.Hour {
-		return errors.New("-valid-for must be between 0 and 24h")
+	if (*requestPath == "") == (*proposalPath == "") || *keyPath == "" {
+		return errors.New("-key and one of -request or -proposal are required")
 	}
 	chainID, subnetID, err := l1.ids()
 	if err != nil {
 		return err
 	}
+	networkID := uint32(*l1.networkID)
+	var p *proposal
+	var c *change
+	if *proposalPath != "" {
+		if p, c, err = readProposal(*proposalPath, networkID, chainID); err != nil {
+			return err
+		}
+	} else {
+		if *valid <= 0 || *valid > 24*time.Hour {
+			return errors.New("-valid-for must be between 0 and 24h")
+		}
+		reg, pop, err := registrationFor(*requestPath, subnetID, *weight, time.Now().Add(*valid))
+		if err != nil {
+			return err
+		}
+		unsigned, err := unsignedFor(networkID, chainID, reg)
+		if err != nil {
+			return err
+		}
+		c = &change{unsigned: unsigned, reg: reg}
+		p = &proposal{UnsignedMessage: hexBytes(unsigned.Bytes()), BLSProofOfPossession: pop}
+		if err := c.label(p); err != nil {
+			return err
+		}
+	}
+	if err := c.check(); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "approving: %s\n", p.Summary)
+	if err := p.addApproval(c.unsigned, networkID, *keyPath); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "approved by %d admin(s): %s\n", len(p.ApprovedBy), strings.Join(p.ApprovedBy, ", "))
+	if *sf.rpcPassFile != "" {
+		return submit(p, c, *l1.nodeURI, chainID, sf)
+	}
+	return printJSON(p)
+}
+
+// registrationFor makes the registration a candidate's request asks for,
+// after checking the request.
+func registrationFor(requestPath string, subnetID ids.ID, weight uint64, expiry time.Time) (*message.RegisterL1Validator, string, error) {
 	var req validatorRequest
-	if err := readJSON(*requestPath, &req); err != nil {
-		return fmt.Errorf("-request: %w", err)
+	if err := readJSON(requestPath, &req); err != nil {
+		return nil, "", fmt.Errorf("-request: %w", err)
 	}
 	nodeID, err := ids.NodeIDFromString(req.NodeID)
 	if err != nil {
-		return fmt.Errorf("request nodeID: %w", err)
+		return nil, "", fmt.Errorf("request nodeID: %w", err)
 	}
 	pkBytes, err := unhex(req.BLSPublicKey, "request blsPublicKey")
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	popBytes, err := unhex(req.BLSProofOfPossession, "request blsProofOfPossession")
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	// The P-Chain checks the proof of possession at registration; checking
 	// it here catches a mistyped request before anyone signs.
 	pk, err := bls.PublicKeyFromCompressedBytes(pkBytes)
 	if err != nil {
-		return fmt.Errorf("request blsPublicKey: %w", err)
+		return nil, "", fmt.Errorf("request blsPublicKey: %w", err)
 	}
 	popSig, err := bls.SignatureFromBytes(popBytes)
 	if err != nil {
-		return fmt.Errorf("request blsProofOfPossession: %w", err)
+		return nil, "", fmt.Errorf("request blsProofOfPossession: %w", err)
 	}
 	if !bls.VerifyProofOfPossession(pk, popSig, pkBytes) {
-		return errors.New("the request's proof of possession doesn't match its BLS key")
+		return nil, "", errors.New("the request's proof of possession doesn't match its BLS key")
 	}
 	owner, err := pOwner(req.Owner)
 	if err != nil {
-		return fmt.Errorf("request owner: %w", err)
+		return nil, "", fmt.Errorf("request owner: %w", err)
 	}
 	var pkArr [bls.PublicKeyLen]byte
 	copy(pkArr[:], pkBytes)
-	expiry := time.Now().Add(*valid)
-	reg, err := message.NewRegisterL1Validator(subnetID, nodeID, pkArr, uint64(expiry.Unix()), owner, owner, *weight)
+	reg, err := message.NewRegisterL1Validator(subnetID, nodeID, pkArr, uint64(expiry.Unix()), owner, owner, weight)
+	return reg, req.BLSProofOfPossession, err
+}
+
+// cmdSubmit has the validators sign a proposal with enough approvals.
+func cmdSubmit(args []string) error {
+	fs := flag.NewFlagSet("submit", flag.ExitOnError)
+	l1 := addL1Flags(fs)
+	proposalPath := fs.String("proposal", "", "the proposal, with its approvals")
+	sf := addSubmitFlags(fs, false)
+	_ = fs.Parse(args)
+	if *proposalPath == "" || *sf.rpcPassFile == "" {
+		return errors.New("-proposal and -rpc-pass-file are required")
+	}
+	chainID, _, err := l1.ids()
 	if err != nil {
 		return err
 	}
-	unsigned, err := unsignedFor(uint32(*l1.networkID), chainID, reg)
+	p, c, err := readProposal(*proposalPath, uint32(*l1.networkID), chainID)
 	if err != nil {
 		return err
 	}
-	signed, err := approveAndCollect(*l1.nodeURI, chainID, *keyPath, *rpcUser, *rpcPassFile, unsigned)
-	if err != nil {
-		return err
-	}
-	return printJSON(registration{
-		NodeID:               nodeID.String(),
-		ValidationID:         reg.ValidationID().String(),
-		Weight:               *weight,
-		Expiry:               expiry.UTC().Format(time.RFC3339),
-		BLSProofOfPossession: req.BLSProofOfPossession,
-		SignedMessage:        hexBytes(signed.Bytes()),
-	})
+	fmt.Fprintf(os.Stderr, "submitting: %s\n", p.Summary)
+	return submit(p, c, *l1.nodeURI, chainID, sf)
 }
 
 func pWallet(uri, keyPath string) (pwallet.Wallet, error) {
@@ -378,18 +650,16 @@ func registrationIn(signed []byte) (*message.RegisterL1Validator, error) {
 	return message.ParseRegisterL1Validator(call.Payload)
 }
 
-// cmdRemove removes a validator (sets its weight to 0).
+// cmdRemove starts a proposal to remove a validator (set its weight to 0).
 func cmdRemove(args []string) error {
 	fs := flag.NewFlagSet("remove", flag.ExitOnError)
 	l1 := addL1Flags(fs)
 	validationFlag := fs.String("validation-id", "", "the validator's validation ID (btcvm-l1 validators)")
 	keyPath := fs.String("key", "", "an admin key")
-	payerPath := fs.String("payer-key", "", "the P-Chain key that pays the fee (default: -key)")
-	rpcUser := fs.String("rpc-user", "btcvm", "the validator node's BTCVM rpcUser")
-	rpcPassFile := fs.String("rpc-pass-file", "", "file holding the validator node's BTCVM rpcPass")
+	sf := addSubmitFlags(fs, true)
 	_ = fs.Parse(args)
-	if *validationFlag == "" || *keyPath == "" || *rpcPassFile == "" {
-		return errors.New("-validation-id, -key and -rpc-pass-file are required")
+	if *validationFlag == "" || *keyPath == "" {
+		return errors.New("-validation-id and -key are required")
 	}
 	chainID, _, err := l1.ids()
 	if err != nil {
@@ -399,8 +669,7 @@ func cmdRemove(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	current, _, err := platformvm.NewClient(*l1.nodeURI).GetL1Validator(ctx, validationID)
+	current, _, err := platformvm.NewClient(*l1.nodeURI).GetL1Validator(context.Background(), validationID)
 	if err != nil {
 		return fmt.Errorf("reading the validator: %w", err)
 	}
@@ -408,27 +677,27 @@ func cmdRemove(args []string) error {
 	if err != nil {
 		return err
 	}
-	unsigned, err := unsignedFor(uint32(*l1.networkID), chainID, w)
+	networkID := uint32(*l1.networkID)
+	unsigned, err := unsignedFor(networkID, chainID, w)
 	if err != nil {
 		return err
 	}
-	signed, err := approveAndCollect(*l1.nodeURI, chainID, *keyPath, *rpcUser, *rpcPassFile, unsigned)
-	if err != nil {
+	c := &change{unsigned: unsigned, weight: w}
+	p := &proposal{UnsignedMessage: hexBytes(unsigned.Bytes())}
+	if err := c.label(p); err != nil {
 		return err
 	}
-	payer := *payerPath
-	if payer == "" {
-		payer = *keyPath
-	}
-	wallet, err := pWallet(*l1.nodeURI, payer)
-	if err != nil {
+	fmt.Fprintf(os.Stderr, "approving: %s\n", p.Summary)
+	if err := p.addApproval(unsigned, networkID, *keyPath); err != nil {
 		return err
 	}
-	tx, err := wallet.IssueSetL1ValidatorWeightTx(signed.Bytes())
-	if err != nil {
-		return fmt.Errorf("removing: %w", err)
+	if *sf.rpcPassFile != "" {
+		if *sf.payerPath == "" {
+			*sf.payerPath = *keyPath
+		}
+		return submit(p, c, *l1.nodeURI, chainID, sf)
 	}
-	return printJSON(map[string]string{"validationID": validationID.String(), "txID": tx.ID().String()})
+	return printJSON(p)
 }
 
 // cmdTopUp adds METAL to a validator's balance for the continuous fee.
