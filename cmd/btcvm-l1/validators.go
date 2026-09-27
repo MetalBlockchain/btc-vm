@@ -33,6 +33,14 @@ package main
 // approve and remove also take -rpc-pass-file, to submit at once when this
 // approval is the last one needed.
 //
+// When a submit fails, submit the same proposal again; don't make a new one.
+// Validators that signed a change hold it (they sign nothing else) until
+// it's on the P-Chain or can't be: a registration until it expires, a
+// weight change until the P-Chain's nonce passes it. Each validator judges
+// deadlines by its own clock and the P-Chain by its own view of it, so
+// leave margin: a change near its deadline, or moments after another,
+// can be refused by some and signed by others.
+//
 // Nothing secret changes hands: a request holds the candidate's NodeID and
 // BLS public key and proof of possession; a proposal holds the unsigned
 // change and the admins' approvals; a registration holds the signed Warp

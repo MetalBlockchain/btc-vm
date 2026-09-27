@@ -310,11 +310,14 @@ N3_ID=$(jq -r .nodeID "$DIR/registration3.json")
 not_validator() { ! has_validator "$1"; }
 wait_for 60 "node 3 off the validator list" not_validator "$N3_ID"
 ok "3 validators left"
-# Block proposers come from a lagged P-Chain height (as the validator
-# signatures do), so a removed validator can still propose for a minute or
-# two. Let that pass, then check.
+# A block's proposers come from its parent's P-Chain height, and a builder
+# moves that height forward only to the P-Chain's lagged minimum (the
+# newest P-Chain block at least 30s old). So: wait until the removal is
+# that old, build a few blocks (they carry a height that has it), and only
+# then check. On an idle chain a removed validator can otherwise still be
+# scheduled for the next block, however long the wait.
+sleep 45
 pay 3
-sleep 120
 FIRST=$(($(height) + 1))
 pay 12
 for h in $(seq $FIRST "$(height)"); do
